@@ -1,0 +1,112 @@
+# Ultralytics RT-DETR Weakly Supervised Configuration
+scale: weak
+# Parameters
+nc: 10  # number of classes
+scales: # model compound scaling constants
+  weak: [1.00, 1.00, 1024]  # [depth, width, max_channels]
+
+# Weak Supervision Configuration
+weak_supervision:
+  enabled: true
+  pseudo_label:
+    initial_threshold: 0.6 # 0.6改为0.5
+    update_interval: 5
+    min_confidence_gain: 0.1
+    max_labels_per_image: 30
+  loss:
+    reliability_weight: 0.3 # 原0.5过高，压制主损失，0.5改为0.3
+    consistency_weight: 0.4 # 提升一致性损失权重，复用已有变量，0.3改为0.4
+
+# Backbone Configuration
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv, [32, 3, 2]]  # 0-P1/2
+  - [-1, 1, CSPDarknetBlock, [64]]  # 1-P2/4
+  - [-1, 1, CSPDarknetStage, [128, 2, 2]]  # 2-P3/8
+  - [-1, 1, CSPDarknetStage, [256, 8, 2]]  # 3-P4/16
+  - [-1, 1, CSPDarknetStage, [512, 8, 2]]  # 4-P5/32
+  - [-1, 1, CSPDarknetStage, [1024, 4, 2]]  # 5-P6/64
+
+# Neck Configuration (Feature Pyramid)
+neck:
+  - [[3, 4, 5], 1, DynamicPseudoCCFM, [[256, 512, 1024], 256, true, 100]]  # 6
+  - [-1, 1, Conv, [256, 1, 1]]  # 7
+
+# Encoder Configuration (AIFI with Pseudo Guidance)
+encoder:
+  - [-1, 1, WeakSupervisionWrapper, [PseudoAIFI(256, 8), 'aifi']]  # 8
+  - [-1, 1, Conv, [256, 1, 1]]  # 9
+
+# Head Configuration
+#head:
+#  - [-1, 1, nn.Linear, [256, 256]]  # 10
+#  - [-1, 1, nn.Linear, [256, nc]]  # 11 classification
+#  - [-1, 1, nn.Linear, [256, 4]]  # 12 regression
+head:
+  # 共享特征层
+  - [-1, 1, nn.Linear, [256, 256]]   # 10
+
+  # ---------- 头 1 (主检测头) ----------
+  - [10, 1, nn.Linear, [256, 256]]   # 11
+  - [-1, 1, nn.Linear, [256, nc]]    # 12
+  - [-1, 1, nn.Linear, [256, 4]]     # 13
+
+  # ---------- 头 2 (辅助检测头) ----------
+  - [10, 1, nn.Linear, [256, 256]]   # 14
+  - [-1, 1, nn.Linear, [256, nc]]    # 15
+  - [-1, 1, nn.Linear, [256, 4]]     # 16
+
+  # ---------- 头 3 (弱监督伪标签头) ----------
+  - [10, 1, nn.Linear, [256, 256]]   # 17
+  - [-1, 1, nn.Linear, [256, nc]]    # 18
+  - [-1, 1, nn.Linear, [256, 4]]     # 19
+
+# Training Configuration
+training:
+  optimizer: adamw
+  lr: 0.0003
+  weight_decay: 0.0001
+  lr_scheduler: cosine
+  warmup_epochs: 3 # 原5轮warmup过长，前期学习率低导致收敛慢，修改为3
+  total_epochs: 100
+  batch_size: 32
+  img_size: 640
+
+  progressive_training:
+    stage1:
+      epochs: 10
+      freeze_backbone: false
+      freeze_neck: false
+      freeze_encoder: true
+      lr_multiplier: 0.5
+    stage2:
+      epochs: 50
+      freeze_backbone: false
+      freeze_neck: false
+      freeze_encoder: false
+      lr_multiplier: 1.0
+    stage3:
+      epochs: 40
+      freeze_backbone: true
+      freeze_neck: false
+      freeze_encoder: false
+      lr_multiplier: 0.05 # 原0.1 → 修改为0.05
+
+# Data Augmentation for Weak Supervision
+augmentation:
+  mosaic: 0.8 # 0.5改为0.8
+  mixup: 0.2 #0.1改为0.2
+  hsv_h: 0.015
+  hsv_s: 0.7
+  hsv_v: 0.4
+  degrees: 10.0
+  translate: 0.1
+  scale: 0.5
+  shear: 2.0
+  perspective: 0.0
+  flipud: 0.0
+  fliplr: 0.5
+
+#  # 在rtdetr-weak.yaml的任意位置新增
+#  weak_supervised: True        # 启用弱监督
+#  reliability_weight: 0.3      # 伪标签可靠性损失权重，0.5改为0.3

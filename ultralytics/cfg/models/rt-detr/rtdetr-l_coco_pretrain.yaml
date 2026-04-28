@@ -1,0 +1,96 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# Ultralytics RT-DETR-l hybrid object detection model with P3/8 - P5/32 outputs
+# Model docs: https://docs.ultralytics.com/models/rtdetr
+# Task docs: https://docs.ultralytics.com/tasks/detect
+
+# Parameters
+nc: 80 # number of classes (VisDrone)
+scales: # model compound scaling constants
+  l: [1.00, 1.00, 640]
+
+## ====================== 核心修改1：半监督/双教师融合超参数（优化权重退火） ======================
+#semi:
+#  teacher1_path: 'runs/pretrain_teacher/teacher1/weights/best.pt'
+#  teacher2_path: 'runs/pretrain_teacher/teacher2/weights/best.pt'
+#
+#  # 伪标签阈值参数（VisDrone适配）
+#  conf_thresh: 0.85
+#  use_dynamic_thresh: true
+#  thresh_min: 0.7
+#  thresh_max: 0.9
+#  thresh_adjust_down: 0.02
+#  thresh_adjust_up: 0.03
+#  small_obj_thresh_offset: -0.1
+#  small_obj_size_thresh: 0.03125
+#  teacher_fusion_weight: [0.5, 0.5]
+#  sup_loss_weight: 1.0
+#
+#  # ====================== 关键修改：无监督损失权重退火（解决分类损失增加核心） ======================
+#  unsup_loss_weight: 0.4          # 初始权重从0.5降到0.4
+#  warmup_steps: 3000               # 预热步数从2000增至3000（延长监督学习）
+#  initial_unsup_weight: 0.4        # 预热后初始权重
+#  weight_increment: 0.05            # 每10轮上调幅度从0.1降到0.05（更平缓）
+#  max_unsup_weight: 1.2             # 最大权重从2.0降到1.2（避免噪声主导）
+#  steps_per_epoch: 324              # 每轮步数（1294/4≈324）
+#
+#  # 新增：伪标签质量优化参数
+#  max_class_ratio: 3.0              # 单个类别伪标签不超过平均的3倍（类别平衡）
+#  nms_iou_thresh: 0.4               # 伪标签NMS过滤阈值
+#
+## ====================== 核心修改2：训练超参数 ======================
+#imgsz: 1024
+#batch: 4
+#epochs: 200
+#lr0: 0.0008
+#optimizer: AdamW
+#patience: 30                       # 早停耐心值从50增至80
+
+# ====================== 数据增强 ======================
+augment:
+  hsv_h: 0.012
+  hsv_s: 0.6
+  hsv_v: 0.35
+  degrees: 0.0
+  translate: 0.1
+  scale: 0.5
+  fliplr: 0.3
+  flipud: 0.0
+  mosaic: 0.4   # COCO 可以开 Mosaic
+  mixup: 0.0    # 预训练阶段不开 Mixup
+  erase: 0.0
+
+# Backbone（保持不变）
+backbone:
+  - [-1, 1, HGStem, [32, 48]] # 0-P2/4
+  - [-1, 6, HGBlock, [48, 128, 3]] # stage 1
+  - [-1, 1, DWConv, [128, 3, 2, 1, False]] # 2-P3/8
+  - [-1, 6, HGBlock, [96, 512, 3]] # stage 2
+  - [-1, 1, DWConv, [512, 3, 2, 1, False]] # 4-P3/16
+  - [-1, 6, HGBlock, [192, 1024, 5, True, False]]
+  - [-1, 6, HGBlock, [192, 1024, 5, True, True]]
+  - [-1, 6, HGBlock, [192, 1024, 5, True, True]] # stage 3
+  - [-1, 1, DWConv, [1024, 3, 2, 1, False]] # 8-P4/32
+  - [-1, 6, HGBlock, [384, 2048, 5, True, False]] # stage 4
+
+# Head（保持不变）
+head:
+  - [-1, 1, Conv, [256, 1, 1, None, 1, 1, False]] # 10 input_proj.2
+  - [-1, 1, AIFI, [1024, 8]]
+  - [-1, 1, Conv, [256, 1, 1]] # 12, Y5, lateral_convs.0
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [7, 1, Conv, [256, 1, 1, None, 1, 1, False]] # 14 input_proj.1
+  - [[-2, -1], 1, Concat, [1]]
+  - [-1, 3, RepC3, [256]] # 16, fpn_blocks.0
+  - [-1, 1, Conv, [256, 1, 1]] # 17, Y4, lateral_convs.1
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [3, 1, Conv, [256, 1, 1, None, 1, 1, False]] # 19 input_proj.0
+  - [[-2, -1], 1, Concat, [1]]
+  - [-1, 3, RepC3, [256]] # X3 (21), fpn_blocks.1
+  - [-1, 1, Conv, [256, 3, 2]] # 22, downsample_convs.0
+  - [[-1, 17], 1, Concat, [1]]
+  - [-1, 3, RepC3, [256]] # F4 (24), pan_blocks.0
+  - [-1, 1, Conv, [256, 3, 2]] # 25, downsample_convs.1
+  - [[-1, 12], 1, Concat, [1]]
+  - [-1, 3, RepC3, [256]] # F5 (27), pan_blocks.1
+  - [[21, 24, 27], 1, RTDETRDecoder, [nc]] # Detect(P3, P4, P5)

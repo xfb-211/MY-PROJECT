@@ -1,0 +1,77 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# Ultralytics RT-DETR-l hybrid object detection model with P3/8 - P5/32 outputs
+# Model docs: https://docs.ultralytics.com/models/rtdetr
+# Task docs: https://docs.ultralytics.com/tasks/detect
+
+# Parameters
+nc: 80 # number of classes (VisDrone)
+scales: # model compound scaling constants
+  l: [1.00, 1.00, 1024]
+
+# ======================== 🔥 半监督 / 双教师核心配置（COCO 专用，已优化） ========================
+semi:
+  teacher1_path: 'runs/coco_pretrain_teacher/teacher1/weights/best.pt'
+  teacher2_path: 'runs/coco_pretrain_teacher/teacher2/weights/best.pt'
+
+  # 伪标签阈值（DTAB-SSOD 论文标准 0.7，必须修改，否则伪标签噪声极大）
+  conf_thresh: 0.7
+  use_dynamic_thresh: false
+  small_obj_thresh_offset: 0.0
+  small_obj_size_thresh: 0.0
+  teacher_fusion_weight: [0.5, 0.5]
+  sup_loss_weight: 1.0
+  # 新增：DTAB核心超参数（论文标准值）
+  cluster_iou_thresh: 0.5
+  match_iou_thresh: 0.5
+  dropblock_prob: 0.2
+  dropblock_size: 7
+  fp_loss_weight: 0.5  # 特征扰动损失权重（论文标准）
+
+  # ====================== 🔥 DTAB-SSOD 官方标准退火策略（必须统一，否则不收敛） ======================
+  burn_up_steps: 3000         # 预热阶段：只训练有监督，无监督权重=0
+  unsup_loss_weight: 0.0
+  warmup_steps: 3000          # 与 burn_up_steps 对齐
+  initial_unsup_weight: 0.05
+  weight_increment: 0.05
+  max_unsup_weight: 1.0
+  steps_per_epoch: 1475        # COCO 10% 标签 + batch=8 最优值（你当前batch=8）
+  ema_decay: 0.9996            # RT-DETR 双教师 EMA 标准衰减率
+
+  # 伪标签质量过滤（保留你原有配置）
+  max_class_ratio: 3.0
+  nms_iou_thresh: 0.5
+
+backbone:
+  - [-1, 1, HGStem, [32, 48]] # 0-P2/4
+  - [-1, 6, HGBlock, [48, 128, 3]] # stage 1
+  - [-1, 1, DWConv, [128, 3, 2, 1, False]] # 2-P3/8
+  - [-1, 6, HGBlock, [96, 512, 3]] # stage 2
+  - [-1, 1, DWConv, [512, 3, 2, 1, False]] # 4-P3/16
+  - [-1, 6, HGBlock, [192, 1024, 5, True, False]]
+  - [-1, 6, HGBlock, [192, 1024, 5, True, True]]
+  - [-1, 6, HGBlock, [192, 1024, 5, True, True]] # stage 3
+  - [-1, 1, DWConv, [1024, 3, 2, 1, False]] # 8-P4/32
+  - [-1, 6, HGBlock, [384, 2048, 5, True, False]] # stage 4
+
+# Head（保持不变）
+head:
+  - [-1, 1, Conv, [256, 1, 1, None, 1, 1, False]] # 10 input_proj.2
+  - [-1, 1, AIFI, [1024, 8]]
+  - [-1, 1, Conv, [256, 1, 1]] # 12, Y5, lateral_convs.0
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [7, 1, Conv, [256, 1, 1, None, 1, 1, False]] # 14 input_proj.1
+  - [[-2, -1], 1, Concat, [1]]
+  - [-1, 3, RepC3, [256]] # 16, fpn_blocks.0
+  - [-1, 1, Conv, [256, 1, 1]] # 17, Y4, lateral_convs.1
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [3, 1, Conv, [256, 1, 1, None, 1, 1, False]] # 19 input_proj.0
+  - [[-2, -1], 1, Concat, [1]]
+  - [-1, 3, RepC3, [256]] # X3 (21), fpn_blocks.1
+  - [-1, 1, Conv, [256, 3, 2]] # 22, downsample_convs.0
+  - [[-1, 17], 1, Concat, [1]]
+  - [-1, 3, RepC3, [256]] # F4 (24), pan_blocks.0
+  - [-1, 1, Conv, [256, 3, 2]] # 25, downsample_convs.1
+  - [[-1, 12], 1, Concat, [1]]
+  - [-1, 3, RepC3, [256]] # F5 (27), pan_blocks.1
+  - [[21, 24, 27], 1, RTDETRDecoder, [nc]] # Detect(P3, P4, P5)

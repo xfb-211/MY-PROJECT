@@ -1,0 +1,49 @@
+# Ultralytics 🚀 AGPL-3.0 License
+# RT-DETR-l + 双教师融合 + 伪标签 + 半监督损失 (适配VisDrone)
+nc: 10  # VisDrone数据集类别数（替换原80）
+scales:
+  l: [1.00, 1.00, 1024]
+
+# 新增：半监督/双教师融合超参数
+semi:
+  teacher1_path: 'path/to/teacher1_best.pt'  # 教师模型1权重
+  teacher2_path: 'path/to/teacher2_best.pt'  # 教师模型2权重
+  pseudo_label_thresh: 0.85  # 伪标签置信度阈值
+  teacher_fusion_weight: [0.5, 0.5]  # 双教师预测融合权重
+  unsup_loss_weight: 0.5  # 无标签数据损失权重
+  sup_loss_weight: 1.0    # 有标签数据损失权重
+
+# 原backbone结构（无需修改）
+backbone:
+  - [-1, 1, HGStem, [32, 48]] # 0-P2/4
+  - [-1, 6, HGBlock, [48, 128, 3]] # stage 1
+  - [-1, 1, DWConv, [128, 3, 2, 1, False]] # 2-P3/8
+  - [-1, 6, HGBlock, [96, 512, 3]] # stage 2
+  - [-1, 1, DWConv, [512, 3, 2, 1, False]] # 4-P3/16
+  - [-1, 6, HGBlock, [192, 1024, 5, True, False]]
+  - [-1, 6, HGBlock, [192, 1024, 5, True, True]]
+  - [-1, 6, HGBlock, [192, 1024, 5, True, True]] # stage 3
+  - [-1, 1, DWConv, [1024, 3, 2, 1, False]] # 8-P4/32
+  - [-1, 6, HGBlock, [384, 2048, 5, True, False]] # stage 4
+
+# 原head结构（最终decoder新增半监督逻辑关联）
+head:
+  - [-1, 1, Conv, [256, 1, 1, None, 1, 1, False]] # 10 input_proj.2
+  - [-1, 1, AIFI, [1024, 8]]
+  - [-1, 1, Conv, [256, 1, 1]] # 12, Y5, lateral_convs.0
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [7, 1, Conv, [256, 1, 1, None, 1, 1, False]] # 14 input_proj.1
+  - [[-2, -1], 1, Concat, [1]]
+  - [-1, 3, RepC3, [256]] # 16, fpn_blocks.0
+  - [-1, 1, Conv, [256, 1, 1]] # 17, Y4, lateral_convs.1
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [3, 1, Conv, [256, 1, 1, None, 1, 1, False]] # 19 input_proj.0
+  - [[-2, -1], 1, Concat, [1]]
+  - [-1, 3, RepC3, [256]] # X3 (21), fpn_blocks.1
+  - [-1, 1, Conv, [256, 3, 2]] # 22, downsample_convs.0
+  - [[-1, 17], 1, Concat, [1]]
+  - [-1, 3, RepC3, [256]] # F4 (24), pan_blocks.0
+  - [-1, 1, Conv, [256, 3, 2]] # 25, downsample_convs.1
+  - [[-1, 12], 1, Concat, [1]]
+  - [-1, 3, RepC3, [256]] # F5 (27), pan_blocks.1
+  - [[21, 24, 27], 1, RTDETRDecoder, [nc]] # 关联半监督损失逻辑
