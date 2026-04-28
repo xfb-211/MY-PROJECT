@@ -34,16 +34,34 @@ class SemiRTDETRTrainer(RTDETRTrainer):
         """Initialize student model + semi-supervised modules."""
         super().setup_model()
 
-        # Read semi config from yaml file directly
         semi_cfg = {}
-        model_cfg_path = self.args.model
-        # model_cfg_path = "./ultralytics/cfg/models/rt-detr/rtdetr-l.yaml"
 
-        if model_cfg_path and os.path.isfile(model_cfg_path):
-            import yaml
-            with open(model_cfg_path, 'r', encoding='utf-8') as f:
-                full_yaml = yaml.safe_load(f)
-            semi_cfg = full_yaml.get('semi', {}) if full_yaml else {}
+        if self.args.model:
+            model_path = str(self.args.model)
+
+            # 情况1: model参数是yaml配置文件
+            if model_path.endswith(('.yaml', '.yml')) and os.path.isfile(model_path):
+                import yaml
+                try:
+                    with open(model_path, 'r', encoding='utf-8') as f:
+                        full_yaml = yaml.safe_load(f)
+                    semi_cfg = full_yaml.get('semi', {}) if full_yaml else {}
+                except Exception as e:
+                    LOGGER.warning(f"[DTAB] Failed to load YAML config: {e}")
+
+            # 情况2: model参数是pt权重文件
+            elif model_path.endswith('.pt'):
+                # 尝试从模型中获取yaml配置路径
+                if hasattr(self.model, 'model') and hasattr(self.model.model, 'yaml_file'):
+                    yaml_path = self.model.model.yaml_file
+                    if os.path.isfile(yaml_path):
+                        import yaml
+                        try:
+                            with open(yaml_path, 'r', encoding='utf-8') as f:
+                                full_yaml = yaml.safe_load(f)
+                            semi_cfg = full_yaml.get('semi', {}) if full_yaml else {}
+                        except Exception as e:
+                            LOGGER.warning(f"[DTAB] Failed to load YAML from model: {e}")
 
         if not semi_cfg:
             LOGGER.warning("[DTAB] No semi config found, fallback to supervised-only training")
