@@ -257,12 +257,14 @@ class SemiRTDETRTrainer(RTDETRTrainer):
         unsup_batch = self.preprocess_batch(unsup_batch)
         x_unsup = unsup_batch["img"]  # [bs, 3, H, W], [0, 1]
 
+        # 弱增强图像：仅水平翻转（用于特征扰动分支）
+        x_unsup_weak = torch.flip(x_unsup, dims=[3])
+
         with torch.no_grad():
             # Teacher inference - raw decoder output
-            x_unsup_flip = torch.flip(x_unsup, dims=[3])
-
+            # Teacher1预测原始图像，Teacher2预测翻转图像
             t1_out = self._teacher_forward(self.teacher1, x_unsup)
-            t2_out = self._teacher_forward(self.teacher2, x_unsup_flip)
+            t2_out = self._teacher_forward(self.teacher2, x_unsup_weak)
 
             pseudo_boxes, pseudo_labels, pseudo_mask = self.pseudo_label_gen(
                 t1_out, t2_out, flipped=True
@@ -287,7 +289,7 @@ class SemiRTDETRTrainer(RTDETRTrainer):
                 sys.stderr.flush()
             return torch.tensor(0.0, device=self.device)
 
-        # Student learns from pseudo-labels
+        # Student learns from pseudo-labels (强增强分支)
         pred_unsup = self._teacher_forward(self.model, x_unsup)
         unsup_loss, _ = self.semi_loss_fn(
             self.model, pred_unsup,
@@ -302,11 +304,11 @@ class SemiRTDETRTrainer(RTDETRTrainer):
             sys.stderr.write(f"\r{_debug_log}\n")
             sys.stderr.flush()
 
-        # Feature perturbation branch
+        # Feature perturbation branch (弱增强分支)
         with torch.no_grad():
             y = []
-            x_fp = x_unsup
-            unwrapped_model = unwrap_model(self.model)  # 解包DDP
+            x_fp = x_unsup_weak  # 使用弱增强图像
+            unwrapped_model = unwrap_model(self.model)
             for m in unwrapped_model.model[:-1]:
                 if m.f != -1:
                     x_fp = y[m.f] if isinstance(m.f, int) else \
@@ -314,10 +316,10 @@ class SemiRTDETRTrainer(RTDETRTrainer):
                 x_fp = m(x_fp)
                 y.append(x_fp if m.i in unwrapped_model.save else None)
 
-            head_inputs = [y[j] for j in self.model.model[-1].f]
+            head_inputs = [y[j] for j in unwrapped_model.model[-1].f]
             head_inputs = [self.dropblock(f) for f in head_inputs]
 
-        head = self.model.model[-1]
+        head = unwrapped_model.model[-1]
         pred_fp = head(head_inputs, batch=pseudo_targets)
         fp_loss, _ = self.semi_loss_fn(
             self.model, pred_fp,
@@ -325,6 +327,9 @@ class SemiRTDETRTrainer(RTDETRTrainer):
             pseudo_mask=pseudo_mask, is_supervised=False
         )
 
+        # RT-DETR损失权重：分类损失和定位损失分别计算
+        # 原始DTAB-SSOD: (cls_loss + rpn_cls_loss) / 2 + (fp_cls_loss + fp_rpn_cls_loss) / 2
+        # RT-DETR无RPN，简化为: (unsup_loss + fp_loss) / 2
         unsup_loss = (unsup_loss + fp_loss) / 2
 
         # EMA update teachers

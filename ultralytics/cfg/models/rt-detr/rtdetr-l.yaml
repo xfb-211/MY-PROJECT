@@ -14,31 +14,33 @@ semi:
   teacher1_path: 'runs/coco_pretrain_teacher/teacher1/weights/best.pt'
   teacher2_path: 'runs/coco_pretrain_teacher/teacher2/weights/best.pt'
 
-  # 伪标签阈值（DTAB-SSOD 论文标准 0.7，必须修改，否则伪标签噪声极大）
+  # 伪标签阈值
   conf_thresh: 0.7
+  cluster_iou: 0.6      # 聚类融合IoU阈值
+  match_iou: 0.6        # 双教师匹配IoU阈值
+
   use_dynamic_thresh: false
   small_obj_thresh_offset: 0.0
   small_obj_size_thresh: 0.0
   teacher_fusion_weight: [0.5, 0.5]
   sup_loss_weight: 1.0
-  # 新增：DTAB核心超参数（论文标准值）
-  cluster_iou_thresh: 0.5
-  match_iou_thresh: 0.5
+
+  # DropBlock参数
   dropblock_prob: 0.2
   dropblock_size: 7
-  fp_loss_weight: 0.5  # 特征扰动损失权重（论文标准）
+  fp_loss_weight: 0.5
 
-  # ====================== 🔥 DTAB-SSOD 论文标准参数 ======================
+  # DTAB-SSOD论文标准参数
   burn_up_steps: 3000
   unsup_loss_weight: 0.0
   warmup_steps: 3000
   initial_unsup_weight: 0.3
-  weight_increment: 0.0            # 固定权重，不再退火
+  weight_increment: 0.0
   max_unsup_weight: 0.3
   steps_per_epoch: 1475
   ema_decay: 0.9996
 
-  # 伪标签质量过滤（保留你原有配置）
+  # 伪标签质量过滤
   max_class_ratio: 3.0
   nms_iou_thresh: 0.5
 
