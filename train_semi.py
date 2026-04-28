@@ -35,33 +35,24 @@ class SemiRTDETRTrainer(RTDETRTrainer):
         super().setup_model()
 
         semi_cfg = {}
+        model_path = str(self.args.model) if self.args.model else ""
 
-        if self.args.model:
-            model_path = str(self.args.model)
+        # 优先尝试加载半监督配置
+        # 情况1: 如果是yaml文件，直接读取
+        if model_path.endswith(('.yaml', '.yml')) and os.path.isfile(model_path):
+            self._load_semi_cfg_from_yaml(model_path, semi_cfg)
 
-            # 情况1: model参数是yaml配置文件
-            if model_path.endswith(('.yaml', '.yml')) and os.path.isfile(model_path):
-                import yaml
-                try:
-                    with open(model_path, 'r', encoding='utf-8') as f:
-                        full_yaml = yaml.safe_load(f)
-                    semi_cfg = full_yaml.get('semi', {}) if full_yaml else {}
-                except Exception as e:
-                    LOGGER.warning(f"[DTAB] Failed to load YAML config: {e}")
-
-            # 情况2: model参数是pt权重文件
-            elif model_path.endswith('.pt'):
-                # 尝试从模型中获取yaml配置路径
-                if hasattr(self.model, 'model') and hasattr(self.model.model, 'yaml_file'):
-                    yaml_path = self.model.model.yaml_file
-                    if os.path.isfile(yaml_path):
-                        import yaml
-                        try:
-                            with open(yaml_path, 'r', encoding='utf-8') as f:
-                                full_yaml = yaml.safe_load(f)
-                            semi_cfg = full_yaml.get('semi', {}) if full_yaml else {}
-                        except Exception as e:
-                            LOGGER.warning(f"[DTAB] Failed to load YAML from model: {e}")
+        # 情况2: 如果是pt文件，尝试从多个来源获取配置
+        elif model_path.endswith('.pt'):
+            # 优先从默认配置文件读取
+            default_yaml_path = "./ultralytics/cfg/models/rt-detr/rtdetr-l.yaml"
+            if os.path.isfile(default_yaml_path):
+                self._load_semi_cfg_from_yaml(default_yaml_path, semi_cfg)
+            # 备用：从模型属性获取
+            elif hasattr(self.model, 'model') and hasattr(self.model.model, 'yaml_file'):
+                yaml_path = self.model.model.yaml_file
+                if os.path.isfile(yaml_path):
+                    self._load_semi_cfg_from_yaml(yaml_path, semi_cfg)
 
         if not semi_cfg:
             LOGGER.warning("[DTAB] No semi config found, fallback to supervised-only training")
@@ -109,6 +100,8 @@ class SemiRTDETRTrainer(RTDETRTrainer):
 
             self.pseudo_label_gen = PseudoLabelGenerator(
                 conf_thresh=semi_cfg.get("conf_thresh", 0.7),
+                cluster_iou=semi_cfg.get("cluster_iou", 0.6),
+                match_iou=semi_cfg.get("match_iou", 0.6),
                 device=device
             ).to(device)
 
@@ -134,6 +127,17 @@ class SemiRTDETRTrainer(RTDETRTrainer):
             LOGGER.info(f"[DTAB] Teacher2 params: {sum(p.numel() for p in self.teacher2.parameters())}")
         else:
             LOGGER.warning("[DTAB] teacher1_path or teacher2_path not found in semi config")
+
+    def _load_semi_cfg_from_yaml(self, yaml_path, semi_cfg):
+        """从yaml文件加载半监督配置"""
+        try:
+            import yaml
+            with open(yaml_path, 'r', encoding='utf-8') as f:
+                full_yaml = yaml.safe_load(f)
+            if full_yaml and 'semi' in full_yaml:
+                semi_cfg.update(full_yaml['semi'])
+        except Exception as e:
+            LOGGER.warning(f"[DTAB] Failed to load YAML config from {yaml_path}: {e}")
 
     def get_dataloader(self, dataset_path, batch_size=16, rank=-1, mode="train"):
         """Build dataloader, also create unlabeled dataloader for training."""
@@ -534,7 +538,7 @@ class SemiRTDETRTrainer(RTDETRTrainer):
 
 
 def main():
-    model_cfg = "./ultralytics/cfg/models/rt-detr/rtdetr-l.yaml"
+    model_cfg = "runs/coco_pretrain_teacher/teacher1/weights/best.pt"
     data_cfg = "./datasets/coco_semi.yaml"
     project = "runs/coco_semi"
     name = "DTAB-SSOD-COCO-Final"
