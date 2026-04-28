@@ -28,15 +28,15 @@ semi:
   dropblock_size: 7
   fp_loss_weight: 0.5  # 特征扰动损失权重（论文标准）
 
-  # ====================== 🔥 DTAB-SSOD 官方标准退火策略（必须统一，否则不收敛） ======================
-  burn_up_steps: 3000         # 预热阶段：只训练有监督，无监督权重=0
+  # ====================== 🔥 DTAB-SSOD 论文标准参数 ======================
+  burn_up_steps: 3000
   unsup_loss_weight: 0.0
-  warmup_steps: 3000          # 与 burn_up_steps 对齐
-  initial_unsup_weight: 0.05
-  weight_increment: 0.05
-  max_unsup_weight: 1.0
-  steps_per_epoch: 1475        # COCO 10% 标签 + batch=8 最优值（你当前batch=8）
-  ema_decay: 0.9996            # RT-DETR 双教师 EMA 标准衰减率
+  warmup_steps: 3000
+  initial_unsup_weight: 0.3
+  weight_increment: 0.0            # 固定权重，不再退火
+  max_unsup_weight: 0.3
+  steps_per_epoch: 1475
+  ema_decay: 0.9996
 
   # 伪标签质量过滤（保留你原有配置）
   max_class_ratio: 3.0
