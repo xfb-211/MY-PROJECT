@@ -2048,9 +2048,11 @@ class PseudoLabelGenerator(nn.Module):
     输出：伪标签 (pseudo_boxes, pseudo_labels, pseudo_mask)
     """
 
-    def __init__(self, conf_thresh=0.7, device="cuda", **kwargs):
+    def __init__(self, conf_thresh=0.7, cluster_iou=0.6, match_iou=0.6, device="cuda", **kwargs):
         super().__init__()
         self.conf_thresh = conf_thresh
+        self.cluster_iou = cluster_iou
+        self.match_iou = match_iou
         self.device = device
 
     @torch.no_grad()
@@ -2077,8 +2079,11 @@ class PseudoLabelGenerator(nn.Module):
         if flipped:
             t2_boxes = t2_boxes.clone()
             # xyxy格式翻转：new_x1 = W - old_x2, new_x2 = W - old_x1
-            t2_boxes[..., 0] = 1.0 - t2_boxes[..., 2]
-            t2_boxes[..., 2] = 1.0 - t2_boxes[..., 0]
+            # 必须先保存原始值，避免覆盖
+            x1_orig = t2_boxes[..., 0].clone()
+            x2_orig = t2_boxes[..., 2].clone()
+            t2_boxes[..., 0] = 1.0 - x2_orig
+            t2_boxes[..., 2] = 1.0 - x1_orig
 
         batch_size = t1_boxes.shape[0]
         device = t1_boxes.device
@@ -2092,12 +2097,12 @@ class PseudoLabelGenerator(nn.Module):
             t1_fused_boxes, t1_fused_labels, t1_fused_scores = \
                 cluster_fusion_single_rt(
                     t1_boxes[b], t1_scores[b],
-                    iou_threshold=0.6, score_threshold=self.conf_thresh
+                    iou_threshold=self.cluster_iou, score_threshold=self.conf_thresh
                 )
             t2_fused_boxes, t2_fused_labels, t2_fused_scores = \
                 cluster_fusion_single_rt(
                     t2_boxes[b], t2_scores[b],
-                    iou_threshold=0.6, score_threshold=self.conf_thresh
+                    iou_threshold=self.cluster_iou, score_threshold=self.conf_thresh
                 )
 
             # 2. 双教师结果匹配对齐
@@ -2105,28 +2110,36 @@ class PseudoLabelGenerator(nn.Module):
                 t2_unmatch_boxes, t2_unmatch_labels = result_match_align(
                     t1_fused_boxes, t1_fused_labels,
                     t2_fused_boxes, t2_fused_labels,
-                    iou_threshold=0.6
+                    iou_threshold=self.match_iou
                 )
 
             # 3. 匹配对加权融合
             fused_boxes = []
             fused_labels = []
             for (i, j) in matched_pairs:
-                fused_box = (t1_fused_scores[i] * t1_fused_boxes[i] +
-                             t2_fused_scores[j] * t2_fused_boxes[j]) / \
-                            (t1_fused_scores[i] + t2_fused_scores[j])
+                # 使用分数加权平均
+                s1, s2 = t1_fused_scores[i], t2_fused_scores[j]
+                fused_box = (s1 * t1_fused_boxes[i] + s2 * t2_fused_boxes[j]) / (s1 + s2 + 1e-8)
                 fused_boxes.append(fused_box)
                 fused_labels.append(t1_fused_labels[i])
 
             # 4. 合并匹配框和未匹配框
             if len(fused_boxes) > 0:
                 fused_boxes_t = torch.stack(fused_boxes)
-                fused_labels_t = torch.tensor(fused_labels, device=device)
-                all_boxes = torch.cat([fused_boxes_t, t1_unmatch_boxes, t2_unmatch_boxes], dim=0)
-                all_labels = torch.cat([fused_labels_t, t1_unmatch_labels, t2_unmatch_labels], dim=0)
+                fused_labels_t = torch.stack(fused_labels)
+                if len(t1_unmatch_boxes) > 0 or len(t2_unmatch_boxes) > 0:
+                    all_boxes = torch.cat([fused_boxes_t, t1_unmatch_boxes, t2_unmatch_boxes], dim=0)
+                    all_labels = torch.cat([fused_labels_t, t1_unmatch_labels, t2_unmatch_labels], dim=0)
+                else:
+                    all_boxes = fused_boxes_t
+                    all_labels = fused_labels_t
             else:
-                all_boxes = torch.cat([t1_unmatch_boxes, t2_unmatch_boxes], dim=0)
-                all_labels = torch.cat([t1_unmatch_labels, t2_unmatch_labels], dim=0)
+                if len(t1_unmatch_boxes) > 0 or len(t2_unmatch_boxes) > 0:
+                    all_boxes = torch.cat([t1_unmatch_boxes, t2_unmatch_boxes], dim=0)
+                    all_labels = torch.cat([t1_unmatch_labels, t2_unmatch_labels], dim=0)
+                else:
+                    all_boxes = torch.empty((0, 4), device=device)
+                    all_labels = torch.empty(0, dtype=torch.long, device=device)
 
             # 5. 填充到固定长度（RT-DETR num_queries=300）
             num_queries = 300
@@ -2135,15 +2148,19 @@ class PseudoLabelGenerator(nn.Module):
             mask[:num_valid] = True
 
             pad_boxes = torch.zeros((num_queries, 4), device=device)
-            pad_boxes[:num_valid] = all_boxes[:num_valid]
+            if num_valid > 0:
+                pad_boxes[:num_valid] = all_boxes[:num_valid]
             pad_labels = torch.zeros(num_queries, dtype=torch.long, device=device)
-            pad_labels[:num_valid] = all_labels[:num_valid]
+            if num_valid > 0:
+                pad_labels[:num_valid] = all_labels[:num_valid]
 
             final_boxes.append(pad_boxes)
             final_labels.append(pad_labels)
             final_masks.append(mask)
 
-        return torch.stack(final_boxes), torch.stack(final_labels), torch.stack(final_masks)
+        return (torch.stack(final_boxes),
+                torch.stack(final_labels),
+                torch.stack(final_masks))
 
 
 # ===================== 纯 PyTorch 极简 DropBlock 实现 =====================
