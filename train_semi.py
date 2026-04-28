@@ -529,8 +529,7 @@ class SemiRTDETRTrainer(RTDETRTrainer):
 
 
 def main():
-    # model_cfg = "./ultralytics/cfg/models/rt-detr/rtdetr-l.yaml"
-    model_cfg = "runs/coco_pretrain_teacher/teacher1/weights/best.pt"
+    model_cfg = "./ultralytics/cfg/models/rt-detr/rtdetr-l.yaml"
     data_cfg = "./datasets/coco_semi.yaml"
     project = "runs/coco_semi"
     name = "DTAB-SSOD-COCO-Final"
@@ -562,7 +561,7 @@ def main():
         "lr0": 1e-5,
         "weight_decay": 0.0001,
         "mosaic": 1.0,
-        "warmup_bias_lr": 0.0,  # ← 新增：关闭 bias 层高 LR warmup
+        "warmup_bias_lr": 0.0,
         "warmup_epochs": 1.0,
     }
 
