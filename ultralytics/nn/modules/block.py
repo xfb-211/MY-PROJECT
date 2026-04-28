@@ -2193,36 +2193,36 @@ class SemiRTDETRLoss(nn.Module):
         self.device = device
         self.sup_weight = 1.0
         self.unsup_weight = 0.0
-        self.criterion = None  # 延迟初始化，在首次forward时从model.criterion获取
+        self.criterion = None
 
     def set_unsup_weight(self, w):
         """动态更新无监督损失权重"""
         self.unsup_weight = w
+
+    def _init_criterion(self, model):
+        """延迟初始化criterion，确保正确获取或创建"""
+        if self.criterion is not None:
+            return
+        if hasattr(model, 'criterion') and model.criterion is not None:
+            self.criterion = model.criterion
+        elif hasattr(model, 'init_criterion'):
+            self.criterion = model.init_criterion()
+        else:
+            from ultralytics.models.utils.loss import RTDETRDetectionLoss
+            self.criterion = RTDETRDetectionLoss(nc=self.num_classes, use_vfl=True)
 
     def forward(self, model, preds, gt_boxes=None, gt_labels=None,
                 pseudo_boxes=None, pseudo_labels=None, pseudo_mask=None,
                 is_supervised=True):
         """
         统一损失计算入口，复用RT-DETR原生criterion
-
-        :param model: RTDETRDetectionModel实例（用于获取criterion）
-        :param preds: RT-DETR的predict输出（dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta）
-        :param gt_boxes: 有标签数据的真实框 [batch, num_gts, 4]（xywh格式）
-        :param gt_labels: 有标签数据的真实类别 [batch, num_gts]
-        :param pseudo_boxes: 伪标签框 [batch, max_pseudo, 4]（xywh格式）
-        :param pseudo_labels: 伪标签类别 [batch, max_pseudo]
-        :param pseudo_mask: 有效伪标签掩码 [batch, max_pseudo]
-        :param is_supervised: 是否为有标签分支
-        :return: (total_loss, loss_dict)
         """
-        if self.criterion is None:
-            self.criterion = model.criterion
+        self._init_criterion(model)
 
         total_loss = 0.0
         loss_dict = {}
 
         if is_supervised and gt_boxes is not None and gt_labels is not None:
-            # 构造RT-DETR原生criterion所需的targets格式
             targets = self._build_sup_targets(gt_boxes, gt_labels)
             loss = self.criterion((preds[0], preds[1]), targets)
             sum_loss = sum(loss.values())
@@ -2231,7 +2231,6 @@ class SemiRTDETRLoss(nn.Module):
             total_loss += self.sup_weight * sum_loss
 
         elif not is_supervised and pseudo_boxes is not None and pseudo_mask is not None:
-            # 构造伪标签targets
             targets = self._build_pseudo_targets(pseudo_boxes, pseudo_labels, pseudo_mask)
             if targets is not None:
                 loss = self.criterion((preds[0], preds[1]), targets)
@@ -2255,7 +2254,7 @@ class SemiRTDETRLoss(nn.Module):
         all_batch_idx = []
 
         for b in range(bs):
-            valid = gt_labels[b] != -1  # -1表示padding
+            valid = gt_labels[b] != -1
             num_valid = valid.sum().item()
             if num_valid > 0:
                 all_cls.append(gt_labels[b, valid])
@@ -2285,8 +2284,6 @@ class SemiRTDETRLoss(nn.Module):
     def _build_pseudo_targets(self, pseudo_boxes, pseudo_labels, pseudo_mask):
         """
         将伪标签转换为RT-DETR criterion所需的targets格式
-        pseudo_boxes: [batch, max_pseudo, 4], pseudo_labels: [batch, max_pseudo]
-        pseudo_mask: [batch, max_pseudo] (bool)
         """
         bs = pseudo_boxes.shape[0]
         all_cls = []
@@ -2302,7 +2299,7 @@ class SemiRTDETRLoss(nn.Module):
                 all_batch_idx.append(torch.full((num_valid,), b, dtype=torch.long, device=pseudo_boxes.device))
 
         if len(all_cls) == 0:
-            return None  # 无有效伪标签时跳过
+            return None
 
         cls = torch.cat(all_cls).to(device=pseudo_boxes.device, dtype=torch.long)
         bboxes = torch.cat(all_bboxes).to(device=pseudo_boxes.device)

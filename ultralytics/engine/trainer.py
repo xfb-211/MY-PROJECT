@@ -202,34 +202,6 @@ class BaseTrainer:
             callbacks.add_integration_callbacks(self)
             # Start console logging immediately at trainer initialization
             self.run_callbacks("on_pretrain_routine_start")
-        # 弱监督相关初始化
-        if getattr(self.args, 'weak_supervision', False):
-            self.init_weak_supervision()
-
-    def init_weak_supervision(self):
-        """初始化弱监督组件"""
-        from ultralytics.data.datasets.weak_utils import AdaptivePseudoLabelManager
-
-        self.pseudo_manager = AdaptivePseudoLabelManager(
-            config={
-                'initial_threshold': getattr(self.args, 'pseudo_threshold', 0.6),
-                'update_interval': getattr(self.args, 'pseudo_update_interval', 5),
-                'max_labels': getattr(self.args, 'max_pseudo_labels', 100)
-            }
-        )
-
-        self.pseudo_labels = None
-
-    def on_train_epoch_end(self):
-        """训练epoch结束时的回调"""
-        if hasattr(self, 'pseudo_manager') and self.pseudo_manager:
-            metrics = {
-                'mAP': self.metrics.get('map50', 0.0) if hasattr(self, 'metrics') else 0.0,
-                'loss': self.loss.mean().item() if hasattr(self, 'loss') else 0.0
-            }
-
-            if self.pseudo_manager.should_update(self.epoch, metrics):
-                self.update_pseudo_labels()
 
     def add_callback(self, event: str, callback):
         """Append the given callback to the event's callback list."""

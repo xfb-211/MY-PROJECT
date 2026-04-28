@@ -194,7 +194,6 @@ class RTDETR_Semi(Model):
         :param gt_labels: 有标签真实类别 [bs, max_gts]
         :return: (total_loss, loss_dict)
         """
-        # 更新无监督权重
         self._update_unsup_weight()
 
         teacher1 = self._modules['_teacher1']
@@ -204,9 +203,10 @@ class RTDETR_Semi(Model):
         semi_loss_fn = self._modules['_semi_loss_fn']
 
         # ========== 1. 监督分支 ==========
-        # 构造监督targets
         sup_targets = semi_loss_fn._build_sup_targets(gt_boxes, gt_labels)
-        pred_sup = self.model.predict(x_sup, batch=sup_targets)  # 训练模式：5元组
+        pred_sup = self.model(x_sup)
+        if isinstance(pred_sup, tuple) and len(pred_sup) == 2:
+            pred_sup = pred_sup[1]
         sup_loss, sup_dict = semi_loss_fn(
             self.model, pred_sup, gt_boxes=gt_boxes, gt_labels=gt_labels,
             is_supervised=True
@@ -214,23 +214,29 @@ class RTDETR_Semi(Model):
 
         # ========== 2. 伪标签生成 ==========
         with torch.no_grad():
-            x_unsup_flip = torch.flip(x_unsup, dims=[3])  # 水平翻转
+            x_unsup_flip = torch.flip(x_unsup, dims=[3])
 
-            # 教师模型推理（eval模式返回 (dec_bboxes, dec_scores)）
-            t1_out = teacher1.predict(x_unsup)       # (dec_bboxes, dec_scores)
-            t2_out = teacher2.predict(x_unsup_flip)  # (dec_bboxes, dec_scores)
+            # 教师模型推理 - 直接调用forward
+            teacher1.eval()
+            teacher2.eval()
+            t1_out = teacher1(x_unsup)
+            t2_out = teacher2(x_unsup_flip)
 
-            # 统一为5元组格式（PseudoLabelGenerator需要）
+            # 处理输出格式
+            if isinstance(t1_out, tuple) and len(t1_out) == 2:
+                t1_out = t1_out[1]
+            if isinstance(t2_out, tuple) and len(t2_out) == 2:
+                t2_out = t2_out[1]
+
+            # 统一为5元组格式
             t1_out_full = (t1_out[0], t1_out[1], None, None, None)
             t2_out_full = (t2_out[0], t2_out[1], None, None, None)
 
-            # 生成伪标签
             pseudo_boxes, pseudo_labels, pseudo_mask = pseudo_gen(
                 t1_out_full, t2_out_full, flipped=True
             )
 
-        # ========== 3. 无监督分支（学生模型在无标签数据上学习伪标签） ==========
-        # 构造伪标签targets
+        # ========== 3. 无监督分支 ==========
         pseudo_targets = semi_loss_fn._build_pseudo_targets(
             pseudo_boxes, pseudo_labels, pseudo_mask
         )
@@ -238,35 +244,34 @@ class RTDETR_Semi(Model):
         unsup_dict = {}
 
         if pseudo_targets is not None:
-            pred_unsup = self.model.predict(x_unsup, batch=pseudo_targets)
+            pred_unsup = self.model(x_unsup)
+            if isinstance(pred_unsup, tuple) and len(pred_unsup) == 2:
+                pred_unsup = pred_unsup[1]
             unsup_loss, unsup_dict = semi_loss_fn(
                 self.model, pred_unsup,
                 pseudo_boxes=pseudo_boxes, pseudo_labels=pseudo_labels,
                 pseudo_mask=pseudo_mask, is_supervised=False
             )
 
-        # ========== 4. 特征扰动分支（DTAB论文特征扰动策略） ==========
+        # ========== 4. 特征扰动分支 ==========
         fp_loss = torch.tensor(0.0, device=x_sup.device)
         fp_dict = {}
 
         if pseudo_targets is not None:
             with torch.no_grad():
-                # 获取backbone特征
                 features = []
                 y = []
                 x_fp = x_unsup
-                for m in self.model.model[:-1]:  # 遍历backbone+neck
+                for m in self.model.model[:-1]:
                     if m.f != -1:
                         x_fp = y[m.f] if isinstance(m.f, int) else \
                             [x_fp if j == -1 else y[j] for j in m.f]
                     x_fp = m(x_fp)
                     y.append(x_fp if m.i in self.model.save else None)
 
-                # 对特征应用DropBlock扰动
                 head_inputs = [y[j] for j in self.model.model[-1].f]
                 head_inputs = [self.dropblock(f) for f in head_inputs]
 
-            # 用扰动特征通过head计算损失
             head = self.model.model[-1]
             pred_fp = head(head_inputs, batch=pseudo_targets)
             fp_loss, fp_dict = semi_loss_fn(
@@ -275,15 +280,13 @@ class RTDETR_Semi(Model):
                 pseudo_mask=pseudo_mask, is_supervised=False
             )
 
-        # ========== 5. 总损失（与DTAB论文一致） ==========
-        # DTAB论文：total = sup_loss + unsup_weight * (unsup_loss + fp_loss) / 2
+        # ========== 5. 总损失 ==========
         current_unsup_weight = semi_loss_fn.unsup_weight
         total_loss = sup_loss + current_unsup_weight * (unsup_loss + fp_loss) / 2
 
         loss_dict = {**sup_dict, **unsup_dict, **{f"fp_{k}": v for k, v in fp_dict.items()}}
         loss_dict["total_loss"] = total_loss
 
-        # EMA更新教师
         dual_fusion.update_teachers(teacher1, teacher2, self.model)
 
         self._pseudo_count = pseudo_mask.sum().item()

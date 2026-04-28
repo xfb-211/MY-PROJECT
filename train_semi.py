@@ -36,8 +36,8 @@ class SemiRTDETRTrainer(RTDETRTrainer):
 
         # Read semi config from yaml file directly
         semi_cfg = {}
-        # model_cfg_path = self.args.model
-        model_cfg_path = "./ultralytics/cfg/models/rt-detr/rtdetr-l.yaml"
+        model_cfg_path = self.args.model
+        # model_cfg_path = "./ultralytics/cfg/models/rt-detr/rtdetr-l.yaml"
 
         if model_cfg_path and os.path.isfile(model_cfg_path):
             import yaml
@@ -288,12 +288,14 @@ class SemiRTDETRTrainer(RTDETRTrainer):
         with torch.no_grad():
             y = []
             x_fp = x_unsup
-            for m in self.model.model[:-1]:
+            unwrapped_model = unwrap_model(self.model)  # 解包DDP
+            for m in unwrapped_model.model[:-1]:
                 if m.f != -1:
                     x_fp = y[m.f] if isinstance(m.f, int) else \
                         [x_fp if j == -1 else y[j] for j in m.f]
                 x_fp = m(x_fp)
-                y.append(x_fp if m.i in self.model.save else None)
+                y.append(x_fp if m.i in unwrapped_model.save else None)
+
             head_inputs = [y[j] for j in self.model.model[-1].f]
             head_inputs = [self.dropblock(f) for f in head_inputs]
 
