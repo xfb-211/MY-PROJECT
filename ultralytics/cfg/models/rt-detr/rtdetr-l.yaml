@@ -15,7 +15,7 @@ semi:
   teacher2_path: 'runs/coco_pretrain_teacher/teacher2/weights/best.pt'
 
   # 伪标签阈值
-  conf_thresh: 0.7
+  conf_thresh: 0.8
   cluster_iou: 0.6      # 聚类融合IoU阈值
   match_iou: 0.6        # 双教师匹配IoU阈值
 
@@ -34,9 +34,9 @@ semi:
   burn_up_steps: 3000
   unsup_loss_weight: 0.0
   warmup_steps: 3000
-  initial_unsup_weight: 0.3
+  initial_unsup_weight: 0.1
   weight_increment: 0.0
-  max_unsup_weight: 0.3
+  max_unsup_weight: 0.15
   steps_per_epoch: 1475
   ema_decay: 0.9996
 
