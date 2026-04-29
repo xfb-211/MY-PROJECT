@@ -536,7 +536,7 @@ class SemiRTDETRTrainer(RTDETRTrainer):
 
 
 def main():
-    model_cfg = "runs/coco_pretrain_teacher/teacher1/weights/best.pt"
+    model_cfg = "rtdetr-l.pt"
     data_cfg = "./datasets/coco_semi.yaml"
     project = "runs/coco_semi"
     name = "DTAB-SSOD-COCO-Final"
