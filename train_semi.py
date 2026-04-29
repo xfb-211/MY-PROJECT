@@ -37,18 +37,12 @@ class SemiRTDETRTrainer(RTDETRTrainer):
         semi_cfg = {}
         model_path = str(self.args.model) if self.args.model else ""
 
-        # 优先尝试加载半监督配置
-        # 情况1: 如果是yaml文件，直接读取
         if model_path.endswith(('.yaml', '.yml')) and os.path.isfile(model_path):
             self._load_semi_cfg_from_yaml(model_path, semi_cfg)
-
-        # 情况2: 如果是pt文件，尝试从多个来源获取配置
         elif model_path.endswith('.pt'):
-            # 优先从默认配置文件读取
             default_yaml_path = "./ultralytics/cfg/models/rt-detr/rtdetr-l.yaml"
             if os.path.isfile(default_yaml_path):
                 self._load_semi_cfg_from_yaml(default_yaml_path, semi_cfg)
-            # 备用：从模型属性获取
             elif hasattr(self.model, 'model') and hasattr(self.model.model, 'yaml_file'):
                 yaml_path = self.model.model.yaml_file
                 if os.path.isfile(yaml_path):
@@ -102,6 +96,8 @@ class SemiRTDETRTrainer(RTDETRTrainer):
                 conf_thresh=semi_cfg.get("conf_thresh", 0.7),
                 cluster_iou=semi_cfg.get("cluster_iou", 0.6),
                 match_iou=semi_cfg.get("match_iou", 0.6),
+                min_pseudo_conf=semi_cfg.get("min_pseudo_conf", 0.8),
+                use_pseudo_filtering=semi_cfg.get("use_pseudo_filtering", True),
                 device=device
             ).to(device)
 
@@ -115,11 +111,11 @@ class SemiRTDETRTrainer(RTDETRTrainer):
                 drop_prob=semi_cfg.get("dropblock_prob", 0.2)
             )
 
-            self.burn_up_steps = semi_cfg.get("burn_up_steps", 12000)
-            self.initial_unsup_weight = semi_cfg.get("initial_unsup_weight", 0.4)
-            self.weight_increment = semi_cfg.get("weight_increment", 0.05)
-            self.max_unsup_weight = semi_cfg.get("max_unsup_weight", 1.0)
-            self.steps_per_epoch = semi_cfg.get("steps_per_epoch", 1475)
+            self.burn_up_steps = semi_cfg.get("burn_up_steps", 5000)
+            self.initial_unsup_weight = semi_cfg.get("initial_unsup_weight", 0.05)
+            self.weight_increment = semi_cfg.get("weight_increment", 0.0)
+            self.max_unsup_weight = semi_cfg.get("max_unsup_weight", 0.15)
+            self.steps_per_epoch = semi_cfg.get("steps_per_epoch", 1479)
             self.global_step = 0
 
             LOGGER.info("[DTAB] Semi-supervised modules initialized successfully")
@@ -184,14 +180,16 @@ class SemiRTDETRTrainer(RTDETRTrainer):
         return loader
 
     def _update_unsup_weight(self):
-        """DTAB standard unsupervised weight annealing."""
+        """DTAB-SSOD改进版无监督权重退火"""
         self.global_step += 1
         if self.global_step < self.burn_up_steps:
             new_weight = 0.0
         else:
-            epochs_after_warmup = (self.global_step - self.burn_up_steps) // max(self.steps_per_epoch, 1)
-            num_steps = max(epochs_after_warmup // 10, 0)
-            new_weight = self.initial_unsup_weight + num_steps * self.weight_increment
+            progress = min(
+                (self.global_step - self.burn_up_steps) / (2 * self.steps_per_epoch),
+                1.0
+            )
+            new_weight = self.initial_unsup_weight + progress * (self.max_unsup_weight - self.initial_unsup_weight)
             new_weight = min(new_weight, self.max_unsup_weight)
 
         self.semi_loss_fn.set_unsup_weight(new_weight)
@@ -538,7 +536,7 @@ class SemiRTDETRTrainer(RTDETRTrainer):
 
 
 def main():
-    model_cfg = "runs/coco_pretrain_teacher/teacher1/weights/best.pt"
+    model_cfg = "rtdetr-l.pt"
     data_cfg = "./datasets/coco_semi.yaml"
     project = "runs/coco_semi"
     name = "DTAB-SSOD-COCO-Final"
