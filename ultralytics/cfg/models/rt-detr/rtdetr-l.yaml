@@ -9,15 +9,19 @@ nc: 80 # number of classes (VisDrone)
 scales: # model compound scaling constants
   l: [1.00, 1.00, 1024]
 
-# ======================== 🔥 半监督 / 双教师核心配置（COCO 专用，已优化） ========================
+# ======================== 半监督 / 双教师核心配置（改进版） ========================
 semi:
   teacher1_path: 'runs/coco_pretrain_teacher/teacher1/weights/best.pt'
   teacher2_path: 'runs/coco_pretrain_teacher/teacher2/weights/best.pt'
 
-  # 伪标签阈值
+  # 伪标签阈值（提高质量）
   conf_thresh: 0.8
-  cluster_iou: 0.6      # 聚类融合IoU阈值
-  match_iou: 0.6        # 双教师匹配IoU阈值
+  cluster_iou: 0.6
+  match_iou: 0.6
+
+  # 伪标签质量过滤
+  use_pseudo_filtering: true
+  min_pseudo_conf: 0.8
 
   use_dynamic_thresh: false
   small_obj_thresh_offset: 0.0
@@ -30,14 +34,14 @@ semi:
   dropblock_size: 7
   fp_loss_weight: 0.5
 
-  # DTAB-SSOD论文标准参数
-  burn_up_steps: 3000
+  # DTAB-SSOD改进参数
+  burn_up_steps: 5000
   unsup_loss_weight: 0.0
-  warmup_steps: 3000
-  initial_unsup_weight: 0.1
+  warmup_steps: 5000
+  initial_unsup_weight: 0.05
   weight_increment: 0.0
   max_unsup_weight: 0.15
-  steps_per_epoch: 1475
+  steps_per_epoch: 1479
   ema_decay: 0.9996
 
   # 伪标签质量过滤
