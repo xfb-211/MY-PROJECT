@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
-
+from ultralytics.utils import LOGGER
 from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
 from .transformer import TransformerBlock
 
@@ -2043,18 +2043,20 @@ class DualTeacherFusion(nn.Module):
 
 class PseudoLabelGenerator(nn.Module):
     """
-    DTAB-SSOD 伪标签生成器，增加质量过滤
+    DTAB-SSOD 伪标签生成器，支持GMM自适应阈值
     """
 
     def __init__(
-        self,
-        conf_thresh=0.7,
-        cluster_iou=0.6,
-        match_iou=0.6,
-        min_pseudo_conf=0.8,
-        use_pseudo_filtering=True,
-        device="cuda",
-        **kwargs
+            self,
+            conf_thresh=0.7,
+            cluster_iou=0.6,
+            match_iou=0.6,
+            min_pseudo_conf=0.7,
+            use_pseudo_filtering=True,
+            use_gmm_filtering=False,
+            covariance_type='full',
+            device="cuda",
+            **kwargs
     ):
         super().__init__()
         self.conf_thresh = conf_thresh
@@ -2062,15 +2064,23 @@ class PseudoLabelGenerator(nn.Module):
         self.match_iou = match_iou
         self.min_pseudo_conf = min_pseudo_conf
         self.use_pseudo_filtering = use_pseudo_filtering
+        self.use_gmm_filtering = use_gmm_filtering
+        self.covariance_type = covariance_type
         self.device = device
+
+        try:
+            from sklearn import mixture as skm
+            self.skm = skm
+        except ImportError:
+            self.skm = None
+            LOGGER.warning("[DTAB] sklearn not installed, GMM filtering disabled")
 
     @torch.no_grad()
     def forward(self, t1_out, t2_out, flipped=False):
         """
-        :param t1_out: teacher1的predict输出 (dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta)
-        :param t2_out: teacher2的predict输出（输入为翻转图）
+        :param t1_out: teacher1的predict输出
+        :param t2_out: teacher2的predict输出
         :param flipped: teacher2的输入是否为水平翻转图
-        :return: (pseudo_boxes [bs, max_q, 4], pseudo_labels [bs, max_q], pseudo_mask [bs, max_q])
         """
         dec_bboxes1, dec_scores1 = t1_out[0], t1_out[1]
         dec_bboxes2, dec_scores2 = t2_out[0], t2_out[1]
@@ -2105,11 +2115,11 @@ class PseudoLabelGenerator(nn.Module):
             )
 
             matched_pairs, t1_unmatch_boxes, t1_unmatch_labels, \
-                t2_unmatch_boxes, t2_unmatch_labels = result_match_align(
-                    t1_fused_boxes, t1_fused_labels,
-                    t2_fused_boxes, t2_fused_labels,
-                    iou_threshold=self.match_iou
-                )
+            t2_unmatch_boxes, t2_unmatch_labels = result_match_align(
+                t1_fused_boxes, t1_fused_labels,
+                t2_fused_boxes, t2_fused_labels,
+                iou_threshold=self.match_iou
+            )
 
             fused_boxes = []
             fused_labels = []
@@ -2146,9 +2156,25 @@ class PseudoLabelGenerator(nn.Module):
                     if j not in matched_idx2:
                         all_scores.append(t2_fused_scores[j])
 
-            if self.use_pseudo_filtering and len(all_boxes) > 0 and len(all_scores) > 0:
-                all_scores_tensor = torch.stack(all_scores) if isinstance(all_scores[0], torch.Tensor) else torch.tensor(all_scores, device=device)
-                valid_idx = all_scores_tensor >= self.min_pseudo_conf
+            # 伪标签过滤
+            if len(all_boxes) > 0 and len(all_scores) > 0:
+                all_scores_tensor = torch.stack(all_scores) if isinstance(all_scores[0],
+                                                                          torch.Tensor) else torch.tensor(all_scores,
+                                                                                                          device=device)
+
+                if self.use_gmm_filtering and self.skm is not None and len(all_scores) >= 5:
+                    # GMM自适应阈值
+                    cost_thr = self._fit_gmm(all_scores_tensor, device)
+                    if cost_thr is not None:
+                        valid_idx = all_scores_tensor >= cost_thr
+                    else:
+                        valid_idx = all_scores_tensor >= self.min_pseudo_conf
+                elif self.use_pseudo_filtering:
+                    # 固定阈值
+                    valid_idx = all_scores_tensor >= self.min_pseudo_conf
+                else:
+                    valid_idx = torch.ones(len(all_scores), dtype=torch.bool, device=device)
+
                 all_boxes = [all_boxes[i] for i in range(len(all_boxes)) if valid_idx[i]]
                 all_labels = [all_labels[i] for i in range(len(all_labels)) if valid_idx[i]]
 
@@ -2170,6 +2196,67 @@ class PseudoLabelGenerator(nn.Module):
             final_masks.append(mask)
 
         return torch.stack(final_boxes), torch.stack(final_labels), torch.stack(final_masks)
+
+    def _fit_gmm(self, scores, device=None):
+        """
+        使用GMM自适应确定伪标签阈值
+        Args:
+            scores: (tensor), 伪标签置信度分数
+        """
+        if self.skm is None:
+            return self.min_pseudo_conf
+
+        scores_np = scores.cpu().numpy()
+        if len(scores_np) < 5:
+            return self.min_pseudo_conf
+
+        scores_sorted = np.sort(scores_np).reshape(-1, 1)
+        min_score, max_score = scores_sorted.min(), scores_sorted.max()
+
+        if max_score - min_score < 0.01:
+            return self.min_pseudo_conf
+
+        means_init = np.array([min_score, max_score]).reshape(2, 1)
+        weights_init = np.array([0.5, 0.5])
+        precisions_init = np.array([1.0, 1.0]).reshape(2, 1, 1)
+
+        if self.covariance_type == 'spherical':
+            precisions_init = precisions_init.reshape(2)
+        elif self.covariance_type == 'diag':
+            precisions_init = precisions_init.reshape(2, 1)
+        elif self.covariance_type == 'tied':
+            precisions_init = np.array([[1.0]])
+
+        try:
+            gmm = self.skm.GaussianMixture(
+                2,
+                weights_init=weights_init,
+                means_init=means_init,
+                precisions_init=precisions_init,
+                covariance_type=self.covariance_type,
+                reg_covar=1e-5
+            )
+            gmm.fit(scores_sorted)
+
+            gmm_assignment = gmm.predict(scores_sorted)
+            log_probs = gmm.score_samples(scores_sorted)
+
+            # 选择高质量簇（均值更高的簇）
+            means = gmm.means_.flatten()
+            high_quality_cluster = np.argmax(means)
+
+            # 获取该簇中的最小分数作为阈值
+            cluster_mask = gmm_assignment == high_quality_cluster
+            if cluster_mask.sum() > 0:
+                cluster_scores = scores_sorted[cluster_mask]
+                threshold = cluster_scores.min()
+                return float(threshold)
+            else:
+                return self.min_pseudo_conf
+
+        except Exception as e:
+            LOGGER.warning(f"[DTAB] GMM fitting failed: {e}")
+            return self.min_pseudo_conf
 
 
 # ===================== 纯 PyTorch 极简 DropBlock 实现 =====================

@@ -14,14 +14,16 @@ semi:
   teacher1_path: 'runs/coco_pretrain_teacher/teacher1/weights/best.pt'
   teacher2_path: 'runs/coco_pretrain_teacher/teacher2/weights/best.pt'
 
-  # 伪标签阈值（提高质量）
-  conf_thresh: 0.8
-  cluster_iou: 0.6
-  match_iou: 0.6
+  # 伪标签阈值（降低以提高召回率）
+  conf_thresh: 0.7
+  cluster_iou: 0.5
+  match_iou: 0.5
 
   # 伪标签质量过滤
   use_pseudo_filtering: true
-  min_pseudo_conf: 0.8
+  use_gmm_filtering: true
+  min_pseudo_conf: 0.6
+  covariance_type: 'full'
 
   use_dynamic_thresh: false
   small_obj_thresh_offset: 0.0
@@ -30,17 +32,17 @@ semi:
   sup_loss_weight: 1.0
 
   # DropBlock参数
-  dropblock_prob: 0.2
+  dropblock_prob: 0.15
   dropblock_size: 7
   fp_loss_weight: 0.5
 
-  # DTAB-SSOD改进参数
-  burn_up_steps: 5000
+  # DTAB-SSOD改进参数（大幅降低权重，延长burn-in）
+  burn_up_steps: 10000
   unsup_loss_weight: 0.0
-  warmup_steps: 5000
-  initial_unsup_weight: 0.05
+  warmup_steps: 10000
+  initial_unsup_weight: 0.02
   weight_increment: 0.0
-  max_unsup_weight: 0.15
+  max_unsup_weight: 0.08
   steps_per_epoch: 1479
   ema_decay: 0.9996
 

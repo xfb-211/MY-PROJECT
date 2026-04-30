@@ -96,8 +96,10 @@ class SemiRTDETRTrainer(RTDETRTrainer):
                 conf_thresh=semi_cfg.get("conf_thresh", 0.7),
                 cluster_iou=semi_cfg.get("cluster_iou", 0.6),
                 match_iou=semi_cfg.get("match_iou", 0.6),
-                min_pseudo_conf=semi_cfg.get("min_pseudo_conf", 0.8),
+                min_pseudo_conf=semi_cfg.get("min_pseudo_conf", 0.7),
                 use_pseudo_filtering=semi_cfg.get("use_pseudo_filtering", True),
+                use_gmm_filtering=semi_cfg.get("use_gmm_filtering", False),
+                covariance_type=semi_cfg.get("covariance_type", "full"),
                 device=device
             ).to(device)
 
