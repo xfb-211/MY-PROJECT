@@ -1,0 +1,76 @@
+# Ultralytics RT-DETR-l 半监督训练配置（保守优化版）
+# 基于纯监督基线结果优化
+
+# Parameters
+nc: 80
+scales:
+  l: [1.00, 1.00, 1024]
+
+# ======================== 半监督配置（保守优化版） ========================
+semi:
+  # 教师模型：使用官方预训练模型（质量更高）
+  teacher1_path: 'rtdetr-l.pt'
+  teacher2_path: 'rtdetr-l.pt'
+
+  # 伪标签阈值（提高以确保高质量）
+  conf_thresh: 0.85
+  cluster_iou: 0.6
+  match_iou: 0.6
+
+  # 伪标签质量过滤
+  use_pseudo_filtering: true
+  use_gmm_filtering: true
+  min_pseudo_conf: 0.85
+  covariance_type: 'full'
+
+  # 教师融合权重
+  teacher_fusion_weight: [0.5, 0.5]
+  sup_loss_weight: 1.0
+
+  # DropBlock参数（降低扰动强度）
+  dropblock_prob: 0.1
+  dropblock_size: 7
+  fp_loss_weight: 0.3
+
+  # 无监督损失权重（极保守）
+  burn_up_steps: 15000
+  initial_unsup_weight: 0.001
+  max_unsup_weight: 0.01
+  weight_increment: 0.0
+  steps_per_epoch: 1479
+
+  # EMA更新
+  ema_decay: 0.9996
+
+backbone:
+  - [-1, 1, HGStem, [32, 48]]
+  - [-1, 6, HGBlock, [48, 128, 3]]
+  - [-1, 1, DWConv, [128, 3, 2, 1, False]]
+  - [-1, 6, HGBlock, [128, 96, 512, 3]]
+  - [-1, 1, DWConv, [512, 3, 2, 1, False]]
+  - [-1, 6, HGBlock, [512, 192, 1024, 5, True, False]]
+  - [-1, 6, HGBlock, [192, 1024, 5, True, True]]
+  - [-1, 6, HGBlock, [192, 1024, 5, True, True]]
+  - [-1, 1, DWConv, [1024, 3, 2, 1, False]]
+  - [-1, 6, HGBlock, [384, 2048, 5, True, False]]
+
+head:
+  - [-1, 1, Conv, [256, 1, 1, None, 1, 1, False]]
+  - [-1, 1, AIFI, [1024, 8]]
+  - [-1, 1, Conv, [256, 1, 1]]
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [7, 1, Conv, [256, 1, 1, None, 1, 1, False]]
+  - [[-2, -1], 1, Concat, [1]]
+  - [-1, 3, RepC3, [256]]
+  - [-1, 1, Conv, [256, 1, 1]]
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [3, 1, Conv, [256, 1, 1, None, 1, 1, False]]
+  - [[-2, -1], 1, Concat, [1]]
+  - [-1, 3, RepC3, [256]]
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [[-1, 17], 1, Concat, [1]]
+  - [-1, 3, RepC3, [256]]
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [[-1, 12], 1, Concat, [1]]
+  - [-1, 3, RepC3, [256]]
+  - [[21, 24, 27], 1, RTDETRDecoder, [nc]]
