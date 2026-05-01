@@ -22,7 +22,7 @@ semi:
   # 伪标签质量过滤
   use_pseudo_filtering: true
   use_gmm_filtering: true
-  min_pseudo_conf: 0.6
+  min_pseudo_conf: 0.7
   covariance_type: 'full'
 
   use_dynamic_thresh: false
@@ -37,12 +37,12 @@ semi:
   fp_loss_weight: 0.5
 
   # DTAB-SSOD改进参数（大幅降低权重，延长burn-in）
-  burn_up_steps: 10000
+  burn_up_steps: 15000
   unsup_loss_weight: 0.0
-  warmup_steps: 10000
-  initial_unsup_weight: 0.02
+  warmup_steps: 15000
+  initial_unsup_weight: 0.01
   weight_increment: 0.0
-  max_unsup_weight: 0.08
+  max_unsup_weight: 0.04
   steps_per_epoch: 1479
   ema_decay: 0.9996
 
