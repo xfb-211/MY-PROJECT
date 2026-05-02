@@ -9,41 +9,39 @@ nc: 80 # number of classes (VisDrone)
 scales: # model compound scaling constants
   l: [1.00, 1.00, 1024]
 
-# ======================== 半监督 / 双教师核心配置（改进版） ========================
+# ======================== 半监督 / 双教师核心配置（方案A：快速修复版） ========================
 semi:
-  teacher1_path: 'runs/coco_pretrain_teacher/teacher1/weights/best.pt'
-  teacher2_path: 'runs/coco_pretrain_teacher/teacher2/weights/best.pt'
+  # 使用官方预训练模型，质量更高
+  teacher1_path: 'rtdetr-l.pt'
+  teacher2_path: 'rtdetr-l.pt'
 
-  # 伪标签阈值（降低以提高召回率）
-  conf_thresh: 0.7
-  cluster_iou: 0.5
-  match_iou: 0.5
+  # 伪标签阈值（放宽，让更多伪标签通过）
+  conf_thresh: 0.6
+  cluster_iou: 0.6
+  match_iou: 0.6
 
-  # 伪标签质量过滤
+  # 伪标签质量过滤（禁用GMM，简化问题）
   use_pseudo_filtering: true
-  use_gmm_filtering: true
-  min_pseudo_conf: 0.7
+  use_gmm_filtering: false
+  min_pseudo_conf: 0.6
   covariance_type: 'full'
 
-  use_dynamic_thresh: false
-  small_obj_thresh_offset: 0.0
-  small_obj_size_thresh: 0.0
   teacher_fusion_weight: [0.5, 0.5]
   sup_loss_weight: 1.0
 
-  # DropBlock参数
-  dropblock_prob: 0.15
+  # DropBlock参数（保留）
+  dropblock_prob: 0.1
   dropblock_size: 7
-  fp_loss_weight: 0.5
+  fp_loss_weight: 0.3
 
-  # DTAB-SSOD改进参数（大幅降低权重，延长burn-in）
-  burn_up_steps: 15000
-  unsup_loss_weight: 0.0
-  warmup_steps: 15000
-  initial_unsup_weight: 0.01
+  # 无监督损失权重（适当增加）
+  burn_up_steps: 10000
+  initial_unsup_weight: 0.005
+  max_unsup_weight: 0.02
   weight_increment: 0.0
-  max_unsup_weight: 0.04
   steps_per_epoch: 1479
+
+  # EMA更新
   ema_decay: 0.9996
 
   # 伪标签质量过滤
