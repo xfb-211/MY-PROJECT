@@ -9,46 +9,73 @@ nc: 80 # number of classes (VisDrone)
 scales: # model compound scaling constants
   l: [1.00, 1.00, 1024]
 
-# ======================== 半监督 / 双教师核心配置（改进版） ========================
+# ======================== 半监督配置（单教师简化版） ========================
 semi:
-  teacher1_path: 'runs/coco_pretrain_teacher/teacher1/weights/best.pt'
-  teacher2_path: 'runs/coco_pretrain_teacher/teacher2/weights/best.pt'
+  # 单教师模式
+  teacher1_path: 'rtdetr-l.pt'
 
-  # 伪标签阈值（降低以提高召回率）
-  conf_thresh: 0.7
-  cluster_iou: 0.5
-  match_iou: 0.5
+  # 伪标签阈值
+  conf_thresh: 0.5
+  min_pseudo_conf: 0.5
 
-  # 伪标签质量过滤
-  use_pseudo_filtering: true
+  # GMM自适应阈值
   use_gmm_filtering: true
-  min_pseudo_conf: 0.6
   covariance_type: 'full'
 
-  use_dynamic_thresh: false
-  small_obj_thresh_offset: 0.0
-  small_obj_size_thresh: 0.0
-  teacher_fusion_weight: [0.5, 0.5]
-  sup_loss_weight: 1.0
+  # EMA更新参数（Mean Teacher）
+  ema_decay: 0.999
 
-  # DropBlock参数
-  dropblock_prob: 0.15
-  dropblock_size: 7
-  fp_loss_weight: 0.5
+  # 一致性损失参数
+  consistency_temperature: 0.1
+  consistency_weight: 0.5
 
-  # DTAB-SSOD改进参数（大幅降低权重，延长burn-in）
+  # 无监督损失权重
   burn_up_steps: 10000
-  unsup_loss_weight: 0.0
-  warmup_steps: 10000
-  initial_unsup_weight: 0.02
+  initial_unsup_weight: 0.005
+  max_unsup_weight: 0.02
   weight_increment: 0.0
-  max_unsup_weight: 0.08
   steps_per_epoch: 1479
-  ema_decay: 0.9996
 
-  # 伪标签质量过滤
-  max_class_ratio: 3.0
-  nms_iou_thresh: 0.5
+## ======================== 半监督 / 双教师核心配置（改进版） ========================
+#semi:
+#  teacher1_path: 'runs/coco_pretrain_teacher/teacher1/weights/best.pt'
+#  teacher2_path: 'runs/coco_pretrain_teacher/teacher2/weights/best.pt'
+#
+#  # 伪标签阈值（降低以提高召回率）
+#  conf_thresh: 0.7
+#  cluster_iou: 0.5
+#  match_iou: 0.5
+#
+#  # 伪标签质量过滤
+#  use_pseudo_filtering: true
+#  use_gmm_filtering: true
+#  min_pseudo_conf: 0.7
+#  covariance_type: 'full'
+#
+#  use_dynamic_thresh: false
+#  small_obj_thresh_offset: 0.0
+#  small_obj_size_thresh: 0.0
+#  teacher_fusion_weight: [0.5, 0.5]
+#  sup_loss_weight: 1.0
+#
+#  # DropBlock参数
+#  dropblock_prob: 0.15
+#  dropblock_size: 7
+#  fp_loss_weight: 0.5
+#
+#  # DTAB-SSOD改进参数（大幅降低权重，延长burn-in）
+#  burn_up_steps: 15000
+#  unsup_loss_weight: 0.0
+#  warmup_steps: 15000
+#  initial_unsup_weight: 0.01
+#  weight_increment: 0.0
+#  max_unsup_weight: 0.04
+#  steps_per_epoch: 1479
+#  ema_decay: 0.9996
+#
+#  # 伪标签质量过滤
+#  max_class_ratio: 3.0
+#  nms_iou_thresh: 0.5
 
 backbone:
   - [-1, 1, HGStem, [32, 48]] # 0-P2/4

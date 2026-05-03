@@ -56,6 +56,9 @@ __all__ = (
     "DualTeacherFusion",
     "PseudoLabelGenerator",
     "SemiRTDETRLoss",
+    "SingleTeacherPseudoLabelGenerator",
+    "MeanTeacherEMA",
+    "ConsistencyLoss",
 )
 
 
@@ -2293,6 +2296,212 @@ class DropBlock(nn.Module):
         x = x * (1 - mask)
         x = x * (1 / (1 - self.drop_prob))
         return x
+
+
+# ===================== 单教师伪标签生成器 =====================
+class SingleTeacherPseudoLabelGenerator(nn.Module):
+    """
+    单教师伪标签生成器
+
+    教师在弱增强图像上生成伪标签，采用GMM自适应阈值+固定置信度双重过滤
+    """
+
+    def __init__(
+            self,
+            conf_thresh=0.5,
+            min_pseudo_conf=0.5,
+            use_gmm_filtering=True,
+            covariance_type='full',
+            device="cuda",
+            **kwargs
+    ):
+        super().__init__()
+        self.conf_thresh = conf_thresh
+        self.min_pseudo_conf = min_pseudo_conf
+        self.use_gmm_filtering = use_gmm_filtering
+        self.covariance_type = covariance_type
+        self.device = device
+
+        try:
+            from sklearn import mixture as skm
+            self.skm = skm
+        except ImportError:
+            self.skm = None
+            LOGGER.warning("[SingleTeacher] sklearn not installed, GMM disabled")
+
+    @torch.no_grad()
+    def forward(self, teacher_out):
+        """
+        从教师输出生成伪标签
+        teacher_out: (dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta)
+        """
+        dec_bboxes, dec_scores = teacher_out[0], teacher_out[1]
+        boxes = dec_bboxes[-1]
+        scores = dec_scores[-1]
+
+        batch_size = boxes.shape[0]
+        device = boxes.device
+
+        final_boxes = []
+        final_labels = []
+        final_masks = []
+
+        for b in range(batch_size):
+            scores_b = scores[b].sigmoid().max(dim=-1)[0]
+            labels_b = scores[b].argmax(dim=-1)
+            boxes_b = boxes[b]
+
+            keep_mask = scores_b >= self.conf_thresh
+            scores_keep = scores_b[keep_mask]
+            labels_keep = labels_b[keep_mask]
+            boxes_keep = boxes_b[keep_mask]
+
+            if len(scores_keep) == 0:
+                num_queries = boxes.shape[1]
+                final_boxes.append(torch.zeros((num_queries, 4), device=device))
+                final_labels.append(torch.zeros(num_queries, dtype=torch.long, device=device))
+                final_masks.append(torch.zeros(num_queries, dtype=torch.bool, device=device))
+                continue
+
+            valid_mask = self._apply_quality_filter(scores_keep, device)
+
+            scores_final = scores_keep[valid_mask]
+            labels_final = labels_keep[valid_mask]
+            boxes_final = boxes_keep[valid_mask]
+
+            num_queries = boxes.shape[1]
+            num_valid = min(len(boxes_final), num_queries)
+
+            pad_boxes = torch.zeros((num_queries, 4), device=device)
+            pad_labels = torch.zeros(num_queries, dtype=torch.long, device=device)
+            mask = torch.zeros(num_queries, dtype=torch.bool, device=device)
+
+            if num_valid > 0:
+                pad_boxes[:num_valid] = boxes_final[:num_valid]
+                pad_labels[:num_valid] = labels_final[:num_valid]
+                mask[:num_valid] = True
+
+            final_boxes.append(pad_boxes)
+            final_labels.append(pad_labels)
+            final_masks.append(mask)
+
+        return (
+            torch.stack(final_boxes),
+            torch.stack(final_labels),
+            torch.stack(final_masks)
+        )
+
+    def _apply_quality_filter(self, scores, device):
+        """GMM自适应阈值 + 固定置信度过滤"""
+        if not self.use_gmm_filtering or self.skm is None or len(scores) < 5:
+            return scores >= self.min_pseudo_conf
+
+        scores_np = scores.cpu().numpy().reshape(-1, 1)
+
+        try:
+            gmm = self.skm.GaussianMixture(
+                n_components=2,
+                covariance_type=self.covariance_type,
+                reg_covar=1e-5,
+                random_state=42
+            )
+            gmm.fit(scores_np)
+
+            means = gmm.means_.flatten()
+            high_quality_cluster = np.argmax(means)
+
+            gmm_assignment = gmm.predict(scores_np)
+            cluster_mask = gmm_assignment == high_quality_cluster
+
+            if cluster_mask.sum() > 0:
+                threshold = scores_np[cluster_mask].min()
+                return scores >= float(threshold)
+        except Exception:
+            pass
+
+        return scores >= self.min_pseudo_conf
+
+
+# ===================== Mean Teacher EMA更新模块 =====================
+class MeanTeacherEMA(nn.Module):
+    """
+    Mean Teacher EMA更新
+
+    使用指数移动平均将学生权重同步到教师模型
+    """
+
+    def __init__(self, teacher_model, student_model, decay=0.999, device='cuda'):
+        super().__init__()
+        self.teacher = teacher_model
+        self.student = student_model
+        self.decay = decay
+        self.device = device
+        self._init_teacher_from_student()
+
+    def _init_teacher_from_student(self):
+        """从学生模型初始化教师模型"""
+        for t_param, s_param in zip(self.teacher.parameters(), self.student.parameters()):
+            t_param.data.copy_(s_param.data)
+            t_param.requires_grad = False
+
+    @torch.no_grad()
+    def update(self):
+        """执行一次EMA更新"""
+        for t_param, s_param in zip(self.teacher.parameters(), self.student.parameters()):
+            t_param.data.mul_(self.decay).add_(s_param.data, alpha=1 - self.decay)
+
+    def train(self, mode=True):
+        self.teacher.train(mode)
+        return super().train(mode)
+
+    def eval(self):
+        self.teacher.eval()
+        return super().eval()
+
+
+# ===================== 一致性损失模块 =====================
+class ConsistencyLoss(nn.Module):
+    """
+    一致性损失：对比去噪查询 + 跨视图特征对齐
+    """
+
+    def __init__(self, temperature=0.1, loss_weight=1.0):
+        super().__init__()
+        self.temperature = temperature
+        self.loss_weight = loss_weight
+
+    def forward(self, student_features, teacher_features, pseudo_mask=None):
+        """计算一致性损失"""
+        if student_features is None or teacher_features is None:
+            return torch.tensor(0.0, device='cpu')
+
+        total_loss = 0.0
+        count = 0
+
+        for s_feat, t_feat in zip(student_features, teacher_features):
+            s_flat = s_feat.flatten(2).transpose(1, 2)
+            t_flat = t_feat.flatten(2).transpose(1, 2)
+
+            s_norm = F.normalize(s_flat, p=2, dim=-1)
+            t_norm = F.normalize(t_flat, p=2, dim=-1)
+
+            similarity = torch.matmul(s_norm, t_norm.transpose(1, 2)) / self.temperature
+
+            batch_size = similarity.shape[0]
+            labels = torch.arange(similarity.shape[1], device=similarity.device)
+            labels = labels.unsqueeze(0).expand(batch_size, -1)
+
+            loss = F.cross_entropy(similarity.view(-1, similarity.size(-1)), labels.view(-1))
+
+            if pseudo_mask is not None:
+                pseudo_mask_flat = pseudo_mask.flatten().float()
+                if pseudo_mask_flat.sum() > 0:
+                    loss = loss * pseudo_mask_flat.mean()
+
+            total_loss += loss
+            count += 1
+
+        return self.loss_weight * (total_loss / max(count, 1))
 
 
 class SemiRTDETRLoss(nn.Module):
