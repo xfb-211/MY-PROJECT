@@ -31,7 +31,9 @@ class SemiRTDETRTrainer(RTDETRTrainer):
         self.semi_model = None
 
     def setup_model(self):
-        """Initialize student model + semi-supervised modules."""
+        """初始化学生模型 + 单教师半监督模块"""
+        import copy
+
         super().setup_model()
 
         semi_cfg = {}
@@ -43,88 +45,82 @@ class SemiRTDETRTrainer(RTDETRTrainer):
             default_yaml_path = "./ultralytics/cfg/models/rt-detr/rtdetr-l.yaml"
             if os.path.isfile(default_yaml_path):
                 self._load_semi_cfg_from_yaml(default_yaml_path, semi_cfg)
-            elif hasattr(self.model, 'model') and hasattr(self.model.model, 'yaml_file'):
-                yaml_path = self.model.model.yaml_file
-                if os.path.isfile(yaml_path):
-                    self._load_semi_cfg_from_yaml(yaml_path, semi_cfg)
 
         if not semi_cfg:
-            LOGGER.warning("[DTAB] No semi config found, fallback to supervised-only training")
+            LOGGER.warning("[SingleTeacher] No semi config found, using supervised-only")
+            self.teacher1 = None
+            self.teacher_ema = None
+            self.consistency_loss_fn = None
             return
 
-        LOGGER.info(f"[DTAB] semi_cfg: {semi_cfg}")
+        LOGGER.info(f"[SingleTeacher] semi_cfg: {semi_cfg}")
 
         from ultralytics.nn.modules.block import (
-            EMAUpdater, DualTeacherFusion, PseudoLabelGenerator,
-            DropBlock, SemiRTDETRLoss
+            SingleTeacherPseudoLabelGenerator,
+            MeanTeacherEMA,
+            ConsistencyLoss,
+            SemiRTDETRLoss
         )
 
         device = self.device
         semi_cfg.setdefault("num_classes", self.data["nc"])
         semi_cfg.setdefault("device", "cuda" if device.type == "cuda" else "cpu")
 
-        teacher1_path = semi_cfg.get("teacher1_path")
-        teacher2_path = semi_cfg.get("teacher2_path")
+        teacher1_path = semi_cfg.get("teacher1_path", "rtdetr-l.pt")
 
-        if teacher1_path and teacher2_path:
-            LOGGER.info(f"[DTAB] Loading teacher1: {teacher1_path}")
+        try:
+            if not os.path.exists(teacher1_path):
+                teacher1_path = "rtdetr-l.pt"
+
+            LOGGER.info(f"[SingleTeacher] Loading teacher from: {teacher1_path}")
             ckpt1 = torch.load(teacher1_path, map_location=device, weights_only=False)
-            teacher1 = ckpt1['model'].float().eval() \
+            self.teacher1 = ckpt1['model'].float().eval() \
                 if isinstance(ckpt1, dict) and 'model' in ckpt1 else ckpt1.float().eval()
-            for p in teacher1.parameters():
+            self.teacher1 = self.teacher1.to(device)
+
+            for p in self.teacher1.parameters():
                 p.requires_grad_(False)
 
-            LOGGER.info(f"[DTAB] Loading teacher2: {teacher2_path}")
-            ckpt2 = torch.load(teacher2_path, map_location=device, weights_only=False)
-            teacher2 = ckpt2['model'].float().eval() \
-                if isinstance(ckpt2, dict) and 'model' in ckpt2 else ckpt2.float().eval()
-            for p in teacher2.parameters():
+        except Exception as e:
+            LOGGER.warning(f"[SingleTeacher] Failed to load teacher: {e}, using student as teacher")
+            self.teacher1 = copy.deepcopy(self.model)
+            for p in self.teacher1.parameters():
                 p.requires_grad_(False)
 
-            self.teacher1 = teacher1.to(device)
-            self.teacher2 = teacher2.to(device)
+        self.pseudo_label_gen = SingleTeacherPseudoLabelGenerator(
+            conf_thresh=semi_cfg.get("conf_thresh", 0.5),
+            min_pseudo_conf=semi_cfg.get("min_pseudo_conf", 0.5),
+            use_gmm_filtering=semi_cfg.get("use_gmm_filtering", True),
+            covariance_type=semi_cfg.get("covariance_type", "full"),
+            device=device
+        ).to(device)
 
-            fusion_w = semi_cfg.get("teacher_fusion_weight", semi_cfg.get("fusion_weights", [0.5, 0.5]))
-            self.dual_teacher_fusion = DualTeacherFusion(
-                num_classes=semi_cfg["num_classes"],
-                ema_decay=semi_cfg.get("ema_decay", 0.9996),
-                fusion_weights=fusion_w,
-                device=device
-            ).to(device)
+        self.teacher_ema = MeanTeacherEMA(
+            teacher_model=self.teacher1,
+            student_model=self.model,
+            decay=semi_cfg.get("ema_decay", 0.999),
+            device=device
+        )
 
-            self.pseudo_label_gen = PseudoLabelGenerator(
-                conf_thresh=semi_cfg.get("conf_thresh", 0.7),
-                cluster_iou=semi_cfg.get("cluster_iou", 0.6),
-                match_iou=semi_cfg.get("match_iou", 0.6),
-                min_pseudo_conf=semi_cfg.get("min_pseudo_conf", 0.7),
-                use_pseudo_filtering=semi_cfg.get("use_pseudo_filtering", True),
-                use_gmm_filtering=semi_cfg.get("use_gmm_filtering", False),
-                covariance_type=semi_cfg.get("covariance_type", "full"),
-                device=device
-            ).to(device)
+        self.consistency_loss_fn = ConsistencyLoss(
+            temperature=semi_cfg.get("consistency_temperature", 0.1),
+            loss_weight=semi_cfg.get("consistency_weight", 0.5)
+        ).to(device)
 
-            self.semi_loss_fn = SemiRTDETRLoss(
-                num_classes=semi_cfg["num_classes"],
-                device=device
-            ).to(device)
+        self.semi_loss_fn = SemiRTDETRLoss(
+            num_classes=semi_cfg["num_classes"],
+            device=device
+        ).to(device)
 
-            self.dropblock = DropBlock(
-                block_size=semi_cfg.get("dropblock_size", 7),
-                drop_prob=semi_cfg.get("dropblock_prob", 0.2)
-            )
+        self.burn_up_steps = semi_cfg.get("burn_up_steps", 10000)
+        self.initial_unsup_weight = semi_cfg.get("initial_unsup_weight", 0.005)
+        self.weight_increment = semi_cfg.get("weight_increment", 0.0)
+        self.max_unsup_weight = semi_cfg.get("max_unsup_weight", 0.02)
+        self.steps_per_epoch = semi_cfg.get("steps_per_epoch", 1479)
+        self.global_step = 0
 
-            self.burn_up_steps = semi_cfg.get("burn_up_steps", 5000)
-            self.initial_unsup_weight = semi_cfg.get("initial_unsup_weight", 0.05)
-            self.weight_increment = semi_cfg.get("weight_increment", 0.0)
-            self.max_unsup_weight = semi_cfg.get("max_unsup_weight", 0.15)
-            self.steps_per_epoch = semi_cfg.get("steps_per_epoch", 1479)
-            self.global_step = 0
-
-            LOGGER.info("[DTAB] Semi-supervised modules initialized successfully")
-            LOGGER.info(f"[DTAB] Teacher1 params: {sum(p.numel() for p in self.teacher1.parameters())}")
-            LOGGER.info(f"[DTAB] Teacher2 params: {sum(p.numel() for p in self.teacher2.parameters())}")
-        else:
-            LOGGER.warning("[DTAB] teacher1_path or teacher2_path not found in semi config")
+        LOGGER.info("[SingleTeacher] Semi-supervised modules initialized")
+        LOGGER.info(f"[SingleTeacher] Teacher params: {sum(p.numel() for p in self.teacher1.parameters())}")
 
     def _load_semi_cfg_from_yaml(self, yaml_path, semi_cfg):
         """从yaml文件加载半监督配置"""
@@ -237,9 +233,13 @@ class SemiRTDETRTrainer(RTDETRTrainer):
 
     def _compute_unsup_loss(self):
         """
-        Compute unsupervised loss using teacher pseudo-labels.
-        Must be called OUTSIDE autocast context (teachers run in no_grad fp32).
-        Returns: unsup_loss (tensor, 0.0 if skipped)
+        单教师半监督损失计算
+
+        流程：
+        1. 教师在弱增强图像上生成伪标签（冻结参数）
+        2. 学生在强增强图像上学习
+        3. 计算监督损失 + 一致性损失
+        4. EMA更新教师模型
         """
         if not hasattr(self, 'semi_loss_fn') or self.semi_loss_fn is None:
             return torch.tensor(0.0, device=self.device)
@@ -257,92 +257,94 @@ class SemiRTDETRTrainer(RTDETRTrainer):
         if unsup_batch is None:
             return torch.tensor(0.0, device=self.device)
 
-        # Preprocess unlabeled batch
         unsup_batch = self.preprocess_batch(unsup_batch)
-        x_unsup = unsup_batch["img"]  # [bs, 3, H, W], [0, 1]
+        x_unsup = unsup_batch["img"]
 
-        # 弱增强图像：仅水平翻转（用于特征扰动分支）
-        x_unsup_weak = torch.flip(x_unsup, dims=[3])
+        x_weak = torch.flip(x_unsup, dims=[3])
 
         with torch.no_grad():
-            # Teacher inference - raw decoder output
-            # Teacher1预测原始图像，Teacher2预测翻转图像
-            t1_out = self._teacher_forward(self.teacher1, x_unsup)
-            t2_out = self._teacher_forward(self.teacher2, x_unsup_weak)
+            teacher_out = self._teacher_forward(self.teacher1, x_weak)
+            pseudo_boxes, pseudo_labels, pseudo_mask = self.pseudo_label_gen(teacher_out)
 
-            pseudo_boxes, pseudo_labels, pseudo_mask = self.pseudo_label_gen(
-                t1_out, t2_out, flipped=True
-            )
+            n_valid = pseudo_mask.sum().item() if pseudo_mask is not None else 0
 
-        # ====== DEBUG: log pseudo label stats ======
-        _debug_log = None
-        if self.global_step % 200 == 0:
-            n_pseudo = pseudo_mask.sum().item() if pseudo_mask is not None else 0
-            _debug_log = (f"[DTAB-DEBUG] step={self.global_step} unsup_weight={current_unsup_weight:.4f} "
-                          f"pseudo_labels={pseudo_labels.shape if pseudo_labels is not None else 'None'} "
-                          f"n_valid_pseudo={n_pseudo}")
+            if n_valid == 0:
+                if self.global_step % 200 == 0:
+                    sys.stderr.write(
+                        f"\r[SingleTeacher-Debug] step={self.global_step} unsup_weight={current_unsup_weight:.4f} n_valid_pseudo=0, skipping\n")
+                    sys.stderr.flush()
+                return torch.tensor(0.0, device=self.device)
 
         pseudo_targets = self.semi_loss_fn._build_pseudo_targets(
             pseudo_boxes, pseudo_labels, pseudo_mask
         )
 
         if pseudo_targets is None:
-            if _debug_log is not None:
-                _debug_log += " | pseudo_targets=None, skipping"
-                sys.stderr.write(f"\r{_debug_log}\n")
-                sys.stderr.flush()
             return torch.tensor(0.0, device=self.device)
 
-        # Student learns from pseudo-labels (强增强分支)
+        pseudo_boxes_orig = pseudo_boxes.clone()
+        if pseudo_boxes_orig.shape[-1] == 4:
+            x1 = pseudo_boxes_orig[..., 0].clone()
+            x2 = pseudo_boxes_orig[..., 2].clone()
+            pseudo_boxes_orig[..., 0] = 1.0 - x2
+            pseudo_boxes_orig[..., 2] = 1.0 - x1
+
         pred_unsup = self._teacher_forward(self.model, x_unsup)
         unsup_loss, _ = self.semi_loss_fn(
             self.model, pred_unsup,
-            pseudo_boxes=pseudo_boxes, pseudo_labels=pseudo_labels,
-            pseudo_mask=pseudo_mask, is_supervised=False
+            pseudo_boxes=pseudo_boxes_orig,
+            pseudo_labels=pseudo_labels,
+            pseudo_mask=pseudo_mask,
+            is_supervised=False
         )
 
-        # ====== DEBUG: log unsup loss value (merged with pseudo stats) ======
-        if _debug_log is not None:
-            _debug_log += (f" | unsup_loss={unsup_loss.item():.4f} "
-                           f"weighted={current_unsup_weight * unsup_loss.item():.4f}")
-            sys.stderr.write(f"\r{_debug_log}\n")
+        consistency_loss = torch.tensor(0.0, device=self.device)
+        if hasattr(self, 'consistency_loss_fn') and self.consistency_loss_fn is not None:
+            try:
+                student_features = self._get_model_features(self.model, x_unsup)
+                teacher_features = self._get_model_features(self.teacher1, x_weak)
+                consistency_loss = self.consistency_loss_fn(
+                    student_features, teacher_features, pseudo_mask
+                )
+            except Exception:
+                consistency_loss = torch.tensor(0.0, device=self.device)
+
+        total_unsup_loss = unsup_loss + consistency_loss
+
+        if hasattr(self, 'teacher_ema') and self.teacher_ema is not None:
+            self.teacher_ema.update()
+
+        if self.global_step % 200 == 0:
+            debug_msg = (f"[SingleTeacher-Debug] step={self.global_step} "
+                         f"unsup_weight={current_unsup_weight:.4f} "
+                         f"n_valid_pseudo={n_valid} "
+                         f"unsup_loss={unsup_loss.item():.4f} "
+                         f"consistency_loss={consistency_loss.item():.4f} "
+                         f"total_loss={total_unsup_loss.item():.4f} "
+                         f"weighted={current_unsup_weight * total_unsup_loss.item():.4f}")
+            sys.stderr.write(f"\r{debug_msg}\n")
             sys.stderr.flush()
 
-        # Feature perturbation branch (弱增强分支)
-        with torch.no_grad():
-            y = []
-            x_fp = x_unsup_weak  # 使用弱增强图像
-            unwrapped_model = unwrap_model(self.model)
-            for m in unwrapped_model.model[:-1]:
-                if m.f != -1:
-                    x_fp = y[m.f] if isinstance(m.f, int) else \
-                        [x_fp if j == -1 else y[j] for j in m.f]
-                x_fp = m(x_fp)
-                y.append(x_fp if m.i in unwrapped_model.save else None)
+        return current_unsup_weight * total_unsup_loss
 
-            head_inputs = [y[j] for j in unwrapped_model.model[-1].f]
-            head_inputs = [self.dropblock(f) for f in head_inputs]
+    def _get_model_features(self, model, x):
+        """获取模型中间层特征"""
+        features = []
+        unwrapped_model = unwrap_model(model)
 
-        head = unwrapped_model.model[-1]
-        pred_fp = head(head_inputs, batch=pseudo_targets)
-        fp_loss, _ = self.semi_loss_fn(
-            self.model, pred_fp,
-            pseudo_boxes=pseudo_boxes, pseudo_labels=pseudo_labels,
-            pseudo_mask=pseudo_mask, is_supervised=False
-        )
+        y = []
+        x_t = x
+        for m in unwrapped_model.model[:-1]:
+            if m.f != -1:
+                x_t = y[m.f] if isinstance(m.f, int) else \
+                    [x_t if j == -1 else y[j] for j in m.f]
+            x_t = m(x_t)
+            y.append(x_t if m.i in unwrapped_model.save else None)
 
-        # RT-DETR损失权重：分类损失和定位损失分别计算
-        # 原始DTAB-SSOD: (cls_loss + rpn_cls_loss) / 2 + (fp_cls_loss + fp_rpn_cls_loss) / 2
-        # RT-DETR无RPN，简化为: (unsup_loss + fp_loss) / 2
-        unsup_loss = (unsup_loss + fp_loss) / 2
+            if m.i in [3, 5, 7, 9]:
+                features.append(x_t)
 
-        # EMA update teachers
-        if hasattr(self, 'dual_teacher_fusion'):
-            self.dual_teacher_fusion.update_teachers(
-                self.teacher1, self.teacher2, self.model
-            )
-
-        return current_unsup_weight * unsup_loss
+        return features if features else None
 
     def _do_train(self):
         """Override _do_train to inject unsupervised loss into the training loop."""
@@ -541,7 +543,8 @@ def main():
     model_cfg = "rtdetr-l.pt"
     data_cfg = "./datasets/coco_semi.yaml"
     project = "runs/coco_semi"
-    name = "DTAB-SSOD-COCO-Final"
+    # name = "DTAB-SSOD-COCO-Final"
+    name = "DTAB-SSOD-Conservative"
     epochs = 120
     batch = 8
     imgsz = 640
