@@ -17,8 +17,8 @@ from .predict import RTDETRPredictor
 from .train import RTDETRTrainer
 from .val import RTDETRValidator
 
-# ====================== 新增导入：DTAB-SSOD核心模块 ======================
-from ultralytics.nn.modules.block import DualTeacherFusion, PseudoLabelGenerator, SemiRTDETRLoss, DropBlock
+# ====================== DTAB-SSOD核心模块（单教师版本） ======================
+from ultralytics.nn.modules.block import SingleTeacherPseudoLabelGenerator, MeanTeacherEMA, ConsistencyLoss, SemiRTDETRLoss, DropBlock
 
 
 class RTDETR_Semi(Model):
