@@ -2537,7 +2537,7 @@ class SemiRTDETRLoss(nn.Module):
         if alignment_cost is None:
             return torch.tensor(0.0, device=self.device)
 
-        assigned_gt_inds, assigned_labels = self._one_to_many_assign(alignment_cost.cpu().numpy(),
+        assigned_gt_inds, assigned_labels = self._one_to_many_assign(alignment_cost.detach().cpu().numpy(),
                                                                      gt_labels.cpu().numpy())
         assigned_gt_inds = pred_boxes.new_tensor(assigned_gt_inds).long()
         assigned_labels = pred_boxes.new_tensor(assigned_labels).long()
