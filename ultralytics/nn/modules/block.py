@@ -2635,3 +2635,41 @@ class SemiRTDETRLoss(nn.Module):
 
     def _build_pseudo_targets(self, pseudo_boxes, pseudo_labels, pseudo_mask):
         return {'boxes': pseudo_boxes, 'labels': pseudo_labels, 'mask': pseudo_mask}
+
+
+# ===================== 跨视图查询一致性损失 =====================
+class ConsistencyLoss(nn.Module):
+    """
+    Cross-view Query Consistency Loss (Semi-DETR)
+    计算学生和教师在不同视图下的查询特征一致性
+    """
+    def __init__(self, temperature=0.1, loss_weight=0.5):
+        super().__init__()
+        self.temperature = temperature
+        self.loss_weight = loss_weight
+
+    def forward(self, student_out, teacher_out, pseudo_mask=None):
+        """
+        Args:
+            student_out: 学生模型输出 (dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta)
+            teacher_out: 教师模型输出 (dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta)
+            pseudo_mask: 伪标签有效掩码 [bs, num_queries]
+        
+        Returns:
+            consistency_loss: 跨视图查询一致性损失
+        """
+        dec_scores_student = student_out[1]
+        dec_scores_teacher = teacher_out[1]
+        
+        s_feat = dec_scores_student[-1]
+        t_feat = dec_scores_teacher[-1]
+        
+        if pseudo_mask is not None:
+            s_feat = s_feat[pseudo_mask]
+            t_feat = t_feat[pseudo_mask]
+        
+        s_norm = F.normalize(s_feat, p=2, dim=-1)
+        t_norm = F.normalize(t_feat, p=2, dim=-1)
+        
+        loss = (1 - (s_norm * t_norm).sum(dim=-1)).mean()
+        return loss * self.loss_weight
