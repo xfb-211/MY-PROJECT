@@ -2296,20 +2296,16 @@ class DropBlock(nn.Module):
         return x
 
 
-# ===================== 单教师伪标签生成器 =====================
+# ===================== 单教师伪标签生成器（带成本过滤） =====================
 class SingleTeacherPseudoLabelGenerator(nn.Module):
-    """
-    单教师伪标签生成器
-
-    教师在弱增强图像上生成伪标签，采用GMM自适应阈值+固定置信度双重过滤
-    """
-
     def __init__(
             self,
             conf_thresh=0.5,
             min_pseudo_conf=0.5,
             use_gmm_filtering=True,
             covariance_type='full',
+            cost_alpha=1.0,
+            cost_beta=6,
             device="cuda",
             **kwargs
     ):
@@ -2318,6 +2314,8 @@ class SingleTeacherPseudoLabelGenerator(nn.Module):
         self.min_pseudo_conf = min_pseudo_conf
         self.use_gmm_filtering = use_gmm_filtering
         self.covariance_type = covariance_type
+        self.cost_alpha = cost_alpha
+        self.cost_beta = cost_beta
         self.device = device
 
         try:
@@ -2327,90 +2325,128 @@ class SingleTeacherPseudoLabelGenerator(nn.Module):
             self.skm = None
             LOGGER.warning("[SingleTeacher] sklearn not installed, GMM disabled")
 
-    # 替换block.py中整个SingleTeacherPseudoLabelGenerator.forward方法
     @torch.no_grad()
     def forward(self, teacher_out):
-        """
-        改进的伪标签生成（增加质量过滤）
-        """
         dec_bboxes, dec_scores = teacher_out[0], teacher_out[1]
+        enc_bboxes, enc_scores = teacher_out[2], teacher_out[3]
+
         boxes = dec_bboxes[-1]
         scores = dec_scores[-1]
+        enc_boxes = enc_bboxes[-1]
+        enc_scores_dec = enc_scores[-1]
+
         batch_size = boxes.shape[0]
         device = boxes.device
-        final_boxes = []
-        final_labels = []
-        final_masks = []
+
+        final_boxes, final_labels, final_masks = [], [], []
+
         for b in range(batch_size):
             scores_b = scores[b].sigmoid().max(dim=-1)[0]
             labels_b = scores[b].argmax(dim=-1)
             boxes_b = boxes[b]
-            # 第一次过滤：当前置信度阈值
-            keep_mask = scores_b >= self.conf_thresh
-            scores_keep = scores_b[keep_mask]
-            labels_keep = labels_b[keep_mask]
-            boxes_keep = boxes_b[keep_mask]
-            if len(scores_keep) == 0:
+
+            enc_scores_cls = enc_scores_dec[b].sigmoid()
+
+            if len(enc_boxes) > 0:
+                enc_scores_cls_max = enc_scores_cls.max(dim=-1)[0]
+                valid_mask = self._cost_filter(enc_boxes[b], enc_scores_cls_max, device)
+
+                enc_boxes_f = enc_boxes[b][valid_mask]
+                enc_scores_f = enc_scores_cls[valid_mask]
+                boxes_f = boxes_b[valid_mask] if valid_mask.sum() > 0 else torch.zeros((0, 4), device=device)
+
+                keep = enc_scores_cls_max[valid_mask] >= self.conf_thresh if valid_mask.sum() > 0 else torch.zeros(0,
+                                                                                                                   dtype=torch.bool,
+                                                                                                                   device=device)
+                boxes_keep = boxes_f[keep]
+                labels_keep = enc_scores_f[keep].argmax(dim=-1) if keep.sum() > 0 else torch.zeros(0, dtype=torch.long,
+                                                                                                   device=device)
+
+                if len(boxes_keep) == 0:
+                    num_queries = boxes.shape[1]
+                    final_boxes.append(torch.zeros((num_queries, 4), device=device))
+                    final_labels.append(torch.zeros(num_queries, dtype=torch.long, device=device))
+                    final_masks.append(torch.zeros(num_queries, dtype=torch.bool, device=device))
+                    continue
+
+                gmm_mask = self._apply_quality_filter(enc_scores_cls_max[valid_mask][keep],
+                                                      device) if keep.sum() >= 5 else torch.ones(keep.sum(),
+                                                                                                 dtype=torch.bool,
+                                                                                                 device=device)
+                boxes_final = boxes_keep[gmm_mask]
+                labels_final = labels_keep[gmm_mask]
+
+                num_queries = boxes.shape[1]
+                num_valid = min(len(boxes_final), num_queries)
+
+                pad_boxes = torch.zeros((num_queries, 4), device=device)
+                pad_labels = torch.zeros(num_queries, dtype=torch.long, device=device)
+                mask = torch.zeros(num_queries, dtype=torch.bool, device=device)
+
+                if num_valid > 0:
+                    pad_boxes[:num_valid] = boxes_final[:num_valid]
+                    pad_labels[:num_valid] = labels_final[:num_valid]
+                    mask[:num_valid] = True
+
+                final_boxes.append(pad_boxes)
+                final_labels.append(pad_labels)
+                final_masks.append(mask)
+            else:
                 num_queries = boxes.shape[1]
                 final_boxes.append(torch.zeros((num_queries, 4), device=device))
                 final_labels.append(torch.zeros(num_queries, dtype=torch.long, device=device))
                 final_masks.append(torch.zeros(num_queries, dtype=torch.bool, device=device))
-                continue
-            # 第二次过滤：GMM自适应阈值
-            valid_mask = self._apply_quality_filter(scores_keep, device)
-            scores_final = scores_keep[valid_mask]
-            labels_final = labels_keep[valid_mask]
-            boxes_final = boxes_keep[valid_mask]
-            # 第三次过滤：移除低质量框
-            # 只保留置信度排名前N的伪标签
-            max_pseudo = min(len(boxes_final), 100)  # 限制最大数量
-            if len(scores_final) > max_pseudo:
-                top_idx = torch.argsort(scores_final, descending=True)[:max_pseudo]
-                boxes_final = boxes_final[top_idx]
-                labels_final = labels_final[top_idx]
-            num_queries = boxes.shape[1]
-            num_valid = min(len(boxes_final), num_queries)
-            pad_boxes = torch.zeros((num_queries, 4), device=device)
-            pad_labels = torch.zeros(num_queries, dtype=torch.long, device=device)
-            mask = torch.zeros(num_queries, dtype=torch.bool, device=device)
-            if num_valid > 0:
-                pad_boxes[:num_valid] = boxes_final[:num_valid]
-                pad_labels[:num_valid] = labels_final[:num_valid]
-                mask[:num_valid] = True
-            final_boxes.append(pad_boxes)
-            final_labels.append(pad_labels)
-            final_masks.append(mask)
-        return (
-            torch.stack(final_boxes),
-            torch.stack(final_labels),
-            torch.stack(final_masks)
-        )
+
+        return (torch.stack(final_boxes), torch.stack(final_labels), torch.stack(final_masks))
+
+    def _cost_filter(self, enc_boxes, enc_scores, device):
+        if len(enc_boxes) == 0:
+            return torch.zeros(0, dtype=torch.bool, device=device)
+
+        num_boxes = enc_boxes.shape[0]
+
+        x1 = enc_boxes[:, 0].clamp(min=0)
+        y1 = enc_boxes[:, 1].clamp(min=0)
+        x2 = enc_boxes[:, 2].clamp(max=1)
+        y2 = enc_boxes[:, 3].clamp(max=1)
+
+        area_i = (x2 - x1) * (y2 - y1)
+
+        overlaps = torch.zeros(num_boxes, num_boxes, device=device)
+        for i in range(num_boxes):
+            xx1 = torch.max(x1[i], x1)
+            yy1 = torch.max(y1[i], y1)
+            xx2 = torch.min(x2[i], x2)
+            yy2 = torch.min(y2[i], y2)
+
+            inter = (xx2 - xx1).clamp(min=0) * (yy2 - yy1).clamp(min=0)
+            area_j = (x2 - x1) * (y2 - y1)
+            union = area_i[i] + area_j - inter + 1e-7
+            overlaps[i] = inter / union
+
+        max_overlaps, _ = overlaps.fill_diagonal_(0).max(dim=1)
+        cost = (enc_scores ** self.cost_alpha) * (max_overlaps ** self.cost_beta)
+
+        return cost > 0.05
 
     def _apply_quality_filter(self, scores, device):
-        """GMM自适应阈值 + 固定置信度过滤"""
         if not self.use_gmm_filtering or self.skm is None or len(scores) < 5:
             return scores >= self.min_pseudo_conf
 
         scores_np = scores.cpu().numpy().reshape(-1, 1)
 
         try:
-            gmm = self.skm.GaussianMixture(
-                n_components=2,
-                covariance_type=self.covariance_type,
-                reg_covar=1e-5,
-                random_state=42
-            )
+            gmm = self.skm.GaussianMixture(n_components=2, covariance_type=self.covariance_type, reg_covar=1e-5,
+                                           random_state=42)
             gmm.fit(scores_np)
 
             means = gmm.means_.flatten()
-            high_quality_cluster = np.argmax(means)
+            high_cluster = np.argmax(means)
+            assignment = gmm.predict(scores_np)
+            mask = assignment == high_cluster
 
-            gmm_assignment = gmm.predict(scores_np)
-            cluster_mask = gmm_assignment == high_quality_cluster
-
-            if cluster_mask.sum() > 0:
-                threshold = scores_np[cluster_mask].min()
-                return scores >= float(threshold)
+            if mask.sum() > 0:
+                return scores >= float(scores_np[mask].min())
         except Exception:
             pass
 
@@ -2419,10 +2455,6 @@ class SingleTeacherPseudoLabelGenerator(nn.Module):
 
 # ===================== Mean Teacher EMA更新模块 =====================
 class MeanTeacherEMA(nn.Module):
-    """
-    Mean Teacher EMA更新
-    使用指数移动平均将学生权重同步到教师模型
-    """
     def __init__(self, teacher_model, student_model, decay=0.999, device='cuda'):
         super().__init__()
         self.teacher = teacher_model
@@ -2432,14 +2464,12 @@ class MeanTeacherEMA(nn.Module):
         self._init_teacher_from_student()
 
     def _init_teacher_from_student(self):
-        """从学生模型初始化教师模型（使用state_dict确保所有参数正确复制）"""
-        self.teacher.load_state_dict(self.student.state_dict())
-        for p in self.teacher.parameters():
-            p.requires_grad = False
+        for t_param, s_param in zip(self.teacher.parameters(), self.student.parameters()):
+            t_param.data.copy_(s_param.data)
+            t_param.requires_grad = False
 
     @torch.no_grad()
     def update(self):
-        """执行一次EMA更新"""
         for t_param, s_param in zip(self.teacher.parameters(), self.student.parameters()):
             t_param.data.mul_(self.decay).add_(s_param.data, alpha=1 - self.decay)
 
@@ -2451,295 +2481,157 @@ class MeanTeacherEMA(nn.Module):
         self.teacher.eval()
         return super().eval()
 
-# ===================== 一致性损失模块 =====================
-class ConsistencyLoss(nn.Module):
-    """
-    一致性损失：对比去噪查询 + 跨视图特征对齐
-    """
-    def __init__(self, temperature=0.1, loss_weight=1.0):
-        super().__init__()
-        self.temperature = temperature
-        self.loss_weight = loss_weight
 
-    def forward(self, student_features, teacher_features, pseudo_mask=None):
-        """计算一致性损失"""
-        if student_features is None or teacher_features is None:
-            return torch.tensor(0.0, device='cpu')
-        total_loss = 0.0
-        count = 0
-        for s_feat, t_feat in zip(student_features, teacher_features):
-            s_flat = s_feat.flatten(2).transpose(1, 2)
-            t_flat = t_feat.flatten(2).transpose(1, 2)
-            s_norm = F.normalize(s_flat, p=2, dim=-1)
-            t_norm = F.normalize(t_flat, p=2, dim=-1)
-            similarity = torch.matmul(s_norm, t_norm.transpose(1, 2)) / self.temperature
-            batch_size = similarity.shape[0]
-            labels = torch.arange(similarity.shape[1], device=similarity.device)
-            labels = labels.unsqueeze(0).expand(batch_size, -1)
-            loss = F.cross_entropy(similarity.view(-1, similarity.size(-1)), labels.view(-1))
-            if pseudo_mask is not None:
-                pseudo_mask_flat = pseudo_mask.flatten().float()
-                if pseudo_mask_flat.sum() > 0:
-                    loss = loss * pseudo_mask_flat.mean()
-            total_loss += loss
-            count += 1
-        return self.loss_weight * (total_loss / max(count, 1))
-
+# ===================== 半监督RT-DETR损失（分阶段混合匹配） =====================
 class SemiRTDETRLoss(nn.Module):
-    """
-    半监督损失计算模块，复用RT-DETR原生RTDETRDetectionLoss
-    注意：返回的损失是原始损失，未乘以权重，权重在外部统一处理
-    """
-    def __init__(self, num_classes: int, device="cuda"):
+    def __init__(self, num_classes=80, device='cuda', warm_up_step=60000, **kwargs):
         super().__init__()
         self.num_classes = num_classes
         self.device = device
-        self.sup_weight = 1.0
+        self.warm_up_step = warm_up_step
+        self.curr_step = 0
+        self.o2m_candidate_topk = 13
+        self.alpha = 1.0
+        self.beta = 6.0
         self.unsup_weight = 0.0
-        self.criterion = None
 
-    def set_unsup_weight(self, w):
-        """动态更新无监督损失权重"""
-        self.unsup_weight = w
+    def set_unsup_weight(self, weight):
+        self.unsup_weight = weight
 
-    def _init_criterion(self, model):
-        """延迟初始化criterion，确保正确获取或创建"""
-        if self.criterion is not None:
-            return
-        if hasattr(model, 'criterion') and model.criterion is not None:
-            self.criterion = model.criterion
-        elif hasattr(model, 'init_criterion'):
-            self.criterion = model.init_criterion()
-        else:
-            from ultralytics.models.utils.loss import RTDETRDetectionLoss
-            self.criterion = RTDETRDetectionLoss(nc=self.num_classes, use_vfl=True)
+    def forward(self, model, predictions, pseudo_boxes=None, pseudo_labels=None,
+                pseudo_mask=None, is_supervised=False, **kwargs):
+        self.curr_step += 1
 
-    def forward(self, model, preds, gt_boxes=None, gt_labels=None,
-                pseudo_boxes=None, pseudo_labels=None, pseudo_mask=None,
-                is_supervised=True):
-        """
-        统一损失计算入口，复用RT-DETR原生criterion
-        """
-        self._init_criterion(model)
+        dec_bboxes, dec_scores = predictions[0], predictions[1]
+        pred_boxes = dec_bboxes[-1]
+        pred_scores = dec_scores[-1]
+
+        batch_size = pred_boxes.shape[0]
         total_loss = 0.0
-        loss_dict = {}
 
-        if is_supervised and gt_boxes is not None and gt_labels is not None:
-            targets = self._build_sup_targets(gt_boxes, gt_labels)
-            loss = self.criterion((preds[0], preds[1]), targets)
-            sum_loss = sum(loss.values())
-            loss_dict = {f"sup_{k}": v for k, v in loss.items()}
-            loss_dict["sup_total_loss"] = sum_loss
-            total_loss = sum_loss
+        for b in range(batch_size):
+            if pseudo_boxes is not None and pseudo_labels is not None and pseudo_mask is not None:
+                boxes_b = pseudo_boxes[b]
+                labels_b = pseudo_labels[b]
+                mask_b = pseudo_mask[b]
 
-        elif not is_supervised and pseudo_boxes is not None and pseudo_mask is not None:
-            targets = self._build_pseudo_targets(pseudo_boxes, pseudo_labels, pseudo_mask)
-            if targets is not None:
-                loss = self.criterion((preds[0], preds[1]), targets)
-                sum_loss = sum(loss.values())
-                ud = {f"unsup_{k}": v for k, v in loss.items()}
-                ud["unsup_total_loss"] = sum_loss
-                loss_dict.update(ud)
-                total_loss = sum_loss
+                valid_boxes = boxes_b[mask_b]
+                valid_labels = labels_b[mask_b]
 
-        loss_dict["total_loss"] = total_loss
-        return total_loss, loss_dict
+                if len(valid_boxes) == 0:
+                    continue
 
-    def _build_sup_targets(self, gt_boxes, gt_labels):
-        """
-        将有标签数据转换为RT-DETR criterion所需的targets格式
-        gt_boxes: [batch, max_gts, 4] (xywh), gt_labels: [batch, max_gts]
-        """
-        bs = gt_boxes.shape[0]
-        all_cls = []
-        all_bboxes = []
-        all_batch_idx = []
-        for b in range(bs):
-            valid = gt_labels[b] != -1
-            num_valid = valid.sum().item()
-            if num_valid > 0:
-                all_cls.append(gt_labels[b, valid])
-                all_bboxes.append(gt_boxes[b, valid])
-                all_batch_idx.append(torch.full((num_valid,), b, dtype=torch.long, device=gt_boxes.device))
+                img_shape = (640, 640, 3)
 
-        if len(all_cls) == 0:
-            return {
-                "cls": torch.zeros(0, dtype=torch.long, device=gt_boxes.device),
-                "bboxes": torch.zeros((0, 4), device=gt_boxes.device),
-                "batch_idx": torch.zeros(0, dtype=torch.long, device=gt_boxes.device),
-                "gt_groups": [0] * bs,
-            }
+                if self.curr_step < self.warm_up_step:
+                    loss = self._compute_o2m_loss(pred_boxes[b], pred_scores[b], valid_boxes, valid_labels, img_shape)
+                else:
+                    loss = self._compute_o2o_loss(pred_boxes[b], pred_scores[b], valid_boxes, valid_labels, img_shape)
 
-        cls = torch.cat(all_cls).to(device=gt_boxes.device, dtype=torch.long)
-        bboxes = torch.cat(all_bboxes).to(device=gt_boxes.device)
-        batch_idx = torch.cat(all_batch_idx).to(device=gt_boxes.device, dtype=torch.long)
-        gt_groups = [(batch_idx == i).sum().item() for i in range(bs)]
+                total_loss += loss
 
-        return {
-            "cls": cls,
-            "bboxes": bboxes,
-            "batch_idx": batch_idx,
-            "gt_groups": gt_groups,
-        }
+        return total_loss / max(batch_size, 1), torch.tensor(0.0, device=self.device)
 
-    def _build_pseudo_targets(self, pseudo_boxes, pseudo_labels, pseudo_mask):
-        """
-        将伪标签转换为RT-DETR criterion所需的targets格式
-        关键修复：将RT-DETR输出的xyxy格式转换为criterion需要的xywh格式
-        """
-        bs = pseudo_boxes.shape[0]
-        all_cls = []
-        all_bboxes = []
-        all_batch_idx = []
-        for b in range(bs):
-            mask = pseudo_mask[b]
-            num_valid = mask.sum().item()
-            if num_valid > 0:
-                all_cls.append(pseudo_labels[b, mask])
-                # 坐标转换：xyxy -> xywh (RT-DETR输出是xyxy，criterion需要xywh)
-                xyxy = pseudo_boxes[b, mask]
-                x1, y1, x2, y2 = xyxy.unbind(-1)
-                cx = (x1 + x2) / 2
-                cy = (y1 + y2) / 2
-                w = x2 - x1
-                h = y2 - y1
-                xywh = torch.stack([cx, cy, w, h], dim=-1)
-                all_bboxes.append(xywh)
-                all_batch_idx.append(torch.full((num_valid,), b, dtype=torch.long, device=pseudo_boxes.device))
+    def _compute_o2m_loss(self, pred_boxes, pred_scores, gt_boxes, gt_labels, img_shape):
+        alignment_cost = self._compute_alignment_cost(pred_boxes, pred_scores, gt_boxes, gt_labels, img_shape)
+        if alignment_cost is None:
+            return torch.tensor(0.0, device=self.device)
 
-        if len(all_cls) == 0:
+        assigned_gt_inds, assigned_labels = self._one_to_many_assign(alignment_cost.cpu().numpy(),
+                                                                     gt_labels.cpu().numpy())
+        assigned_gt_inds = pred_boxes.new_tensor(assigned_gt_inds).long()
+        assigned_labels = pred_boxes.new_tensor(assigned_labels).long()
+
+        pos_inds = (assigned_gt_inds > 0)
+        if pos_inds.sum() == 0:
+            return torch.tensor(0.0, device=self.device)
+
+        pos_boxes = pred_boxes[pos_inds]
+        pos_gt_boxes = gt_boxes[assigned_gt_inds[pos_inds] - 1]
+
+        loss_bbox = F.l1_loss(pos_boxes, pos_gt_boxes, reduction='mean')
+        return loss_bbox
+
+    def _compute_o2o_loss(self, pred_boxes, pred_scores, gt_boxes, gt_labels, img_shape):
+        alignment_cost = self._compute_alignment_cost(pred_boxes, pred_scores, gt_boxes, gt_labels, img_shape)
+        if alignment_cost is None:
+            return torch.tensor(0.0, device=self.device)
+
+        cost_np = alignment_cost.detach().cpu().numpy()
+
+        try:
+            from scipy.optimize import linear_sum_assignment
+            row_inds, col_inds = linear_sum_assignment(cost_np)
+        except ImportError:
+            row_inds, col_inds = np.arange(len(pred_boxes)), np.zeros(len(pred_boxes), dtype=int)
+
+        pos_inds = torch.tensor(row_inds, device=pred_boxes.device)
+        if len(pos_inds) == 0:
+            return torch.tensor(0.0, device=self.device)
+
+        pos_boxes = pred_boxes[pos_inds]
+        pos_gt_boxes = gt_boxes[col_inds]
+
+        loss_bbox = F.l1_loss(pos_boxes, pos_gt_boxes, reduction='mean')
+        return loss_bbox
+
+    def _compute_alignment_cost(self, pred_boxes, pred_scores, gt_boxes, gt_labels, img_shape):
+        num_gts = len(gt_boxes)
+        num_preds = len(pred_boxes)
+        if num_gts == 0 or num_preds == 0:
             return None
 
-        cls = torch.cat(all_cls).to(device=pseudo_boxes.device, dtype=torch.long)
-        bboxes = torch.cat(all_bboxes).to(device=pseudo_boxes.device)
-        batch_idx = torch.cat(all_batch_idx).to(device=pseudo_boxes.device, dtype=torch.long)
-        gt_groups = [(batch_idx == i).sum().item() for i in range(bs)]
+        img_h, img_w = img_shape[:2]
+        factor = pred_boxes.new_tensor([img_w, img_h, img_w, img_h]).unsqueeze(0)
 
-        return {
-            "cls": cls,
-            "bboxes": bboxes,
-            "batch_idx": batch_idx,
-            "gt_groups": gt_groups,
-        }
+        normalized_pred = pred_boxes / factor
+        normalized_gt = gt_boxes / factor
 
+        pred_cxcywh = self._xyxy_to_cxcywh(normalized_pred)
+        gt_cxcywh = self._xyxy_to_cxcywh(normalized_gt)
 
-# 在block.py末尾添加（直接复制你原有的代码，适配RT-DETR格式）
-def cluster_fusion_single_rt(boxes, scores_logits, iou_threshold=0.6, score_threshold=0.7):
-    """
-    适配RT-DETR输出格式的单教师聚类融合
-    :param boxes: [num_queries, 4] (xyxy格式，归一化坐标)
-    :param scores_logits: [num_queries, nc] (未sigmoid的logits)
-    :param iou_threshold: 聚类IoU阈值
-    :param score_threshold: 置信度过滤阈值
-    :return: (fused_boxes, fused_labels, fused_scores)
-    """
-    device = boxes.device
-    # 计算最大类别分数和对应标签
-    scores = scores_logits.sigmoid().max(dim=-1)[0]  # [num_queries]
-    labels = scores_logits.argmax(dim=-1)  # [num_queries]
+        cls_scores = pred_scores[gt_labels]
+        ious = self._box_iou(pred_boxes, gt_boxes)
+        alignment_cost = (cls_scores ** self.alpha) * (ious ** self.beta)
 
-    keep_mask = scores >= score_threshold
-    boxes = boxes[keep_mask]
-    scores = scores[keep_mask]
-    labels = labels[keep_mask]
+        return alignment_cost
 
-    if len(boxes) == 0:
-        return (torch.empty((0, 4), device=device),
-                torch.empty(0, dtype=torch.long, device=device),
-                torch.empty(0, device=device))
+    def _one_to_many_assign(self, alignment_cost, gt_labels):
+        num_gts, num_preds = alignment_cost.shape
+        assigned_gt_inds = np.full(num_preds, -1)
+        assigned_labels = np.full(num_preds, -1)
 
-    sorted_idx = torch.argsort(scores, descending=True)
-    boxes = boxes[sorted_idx]
-    scores = scores[sorted_idx]
-    labels = labels[sorted_idx]
+        for gt_idx in range(num_gts):
+            gt_costs = alignment_cost[:, gt_idx]
+            topk = min(self.o2m_candidate_topk, len(gt_costs))
+            topk_indices = np.argsort(gt_costs)[-topk:]
 
-    clusters = []
-    fused_boxes = []
-    fused_scores = []
-    fused_labels = []
+            for pred_idx in topk_indices:
+                if assigned_gt_inds[pred_idx] == -1:
+                    assigned_gt_inds[pred_idx] = gt_idx + 1
+                    assigned_labels[pred_idx] = gt_labels[gt_idx]
+                    break
 
-    for i in range(len(boxes)):
-        current_box = boxes[i]
-        current_label = labels[i]
-        matched = False
-        for j in range(len(fused_boxes)):
-            iou = calculate_iou_xyxy(current_box.unsqueeze(0), fused_boxes[j].unsqueeze(0)).item()
-            if iou > iou_threshold and current_label == fused_labels[j]:
-                clusters[j].append(i)
-                cluster_scores = scores[torch.tensor(clusters[j])]
-                weights = cluster_scores / cluster_scores.sum()
-                fused_boxes[j] = (weights.unsqueeze(1) * boxes[torch.tensor(clusters[j])]).sum(dim=0)
-                fused_scores[j] = cluster_scores.mean()
-                matched = True
-                break
-        if not matched:
-            clusters.append([i])
-            fused_boxes.append(boxes[i])
-            fused_scores.append(scores[i])
-            fused_labels.append(labels[i])
+        return assigned_gt_inds, assigned_labels
 
-    return torch.stack(fused_boxes), torch.tensor(fused_labels, device=device), torch.tensor(fused_scores, device=device)
+    def _box_iou(self, boxes1, boxes2):
+        area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
+        area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
 
+        lt = torch.max(boxes1[:, None, :2], boxes2[:, :2])
+        rb = torch.min(boxes1[:, None, 2:], boxes2[:, 2:])
 
-def calculate_iou_xyxy(box1, box2):
-    """xyxy格式IoU计算（RT-DETR输出的框为xyxy归一化格式）"""
-    inter_x1 = torch.max(box1[..., 0], box2[..., 0])
-    inter_y1 = torch.max(box1[..., 1], box2[..., 1])
-    inter_x2 = torch.min(box1[..., 2], box2[..., 2])
-    inter_y2 = torch.min(box1[..., 3], box2[..., 3])
+        inter = (rb - lt).clamp(min=0).prod(dim=2)
+        union = area1[:, None] + area2 - inter
 
-    inter_area = torch.clamp(inter_x2 - inter_x1, min=0) * torch.clamp(inter_y2 - inter_y1, min=0)
-    area1 = (box1[..., 2] - box1[..., 0]) * (box1[..., 3] - box1[..., 1])
-    area2 = (box2[..., 2] - box2[..., 0]) * (box2[..., 3] - box2[..., 1])
-    return inter_area / (area1 + area2 - inter_area + 1e-8)
+        return inter / (union + 1e-7)
 
+    def _xyxy_to_cxcywh(self, boxes):
+        cx = (boxes[:, 0] + boxes[:, 2]) / 2
+        cy = (boxes[:, 1] + boxes[:, 3]) / 2
+        w = boxes[:, 2] - boxes[:, 0]
+        h = boxes[:, 3] - boxes[:, 1]
+        return torch.stack([cx, cy, w, h], dim=-1)
 
-def result_match_align(boxes1, labels1, boxes2, labels2, iou_threshold=0.6):
-    """
-    双教师结果匹配对齐（独立函数，不依赖self）
-    :param boxes1: [N1, 4] (xyxy)
-    :param labels1: [N1]
-    :param boxes2: [N2, 4] (xyxy)
-    :param labels2: [N2]
-    :return: (matched_pairs, unmatched_boxes1, unmatched_labels1, unmatched_boxes2, unmatched_labels2)
-    """
-    device = boxes1.device
-    num1 = len(boxes1)
-    num2 = len(boxes2)
-
-    if num1 == 0 or num2 == 0:
-        return [], boxes1, labels1, boxes2, labels2
-
-    # 构建标签矩阵和IoU矩阵
-    label_matrix = (labels1.unsqueeze(1) == labels2.unsqueeze(0)).int()
-    iou_matrix = torch.zeros((num1, num2), device=device)
-    for i in range(num1):
-        for j in range(num2):
-            iou_matrix[i, j] = calculate_iou_xyxy(boxes1[i], boxes2[j])
-
-    # 贪心匹配
-    matched_pairs = []
-    active_matrix = iou_matrix.clone()
-    while True:
-        max_iou, flat_idx = active_matrix.flatten().max(dim=0)
-        if max_iou < iou_threshold:
-            break
-        idx1, idx2 = np.unravel_index(flat_idx.item(), active_matrix.shape)
-        if label_matrix[idx1, idx2]:
-            matched_pairs.append((idx1, idx2))
-            active_matrix[idx1, :] = -1
-            active_matrix[:, idx2] = -1
-        else:
-            active_matrix[idx1, idx2] = -1
-
-    # 提取未匹配的框
-    matched_idx1 = [p[0] for p in matched_pairs]
-    matched_idx2 = [p[1] for p in matched_pairs]
-    unmatched_idx1 = [i for i in range(num1) if i not in matched_idx1]
-    unmatched_idx2 = [i for i in range(num2) if i not in matched_idx2]
-
-    return (matched_pairs,
-            boxes1[unmatched_idx1] if unmatched_idx1 else torch.empty((0, 4), device=device),
-            labels1[unmatched_idx1] if unmatched_idx1 else torch.empty(0, dtype=torch.long, device=device),
-            boxes2[unmatched_idx2] if unmatched_idx2 else torch.empty((0, 4), device=device),
-            labels2[unmatched_idx2] if unmatched_idx2 else torch.empty(0, dtype=torch.long, device=device))
+    def _build_pseudo_targets(self, pseudo_boxes, pseudo_labels, pseudo_mask):
+        return {'boxes': pseudo_boxes, 'labels': pseudo_labels, 'mask': pseudo_mask}

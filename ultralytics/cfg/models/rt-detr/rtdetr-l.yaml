@@ -9,24 +9,31 @@ nc: 80 # number of classes (VisDrone)
 scales: # model compound scaling constants
   l: [1.00, 1.00, 1024]
 
-# ======================== 半监督配置（抗噪声优化版） ========================
+# ======================== 半监督配置（Semi-DETR改进版） ========================
 semi:
   teacher1_path: 'runs/teacher_training/RTDETR-Teacher/weights/best.pt'
 
-  # 伪标签阈值（初始值，课程学习会动态调整）
-  conf_thresh: 0.7
-  min_pseudo_conf: 0.7
+  # 伪标签阈值
+  conf_thresh: 0.5
+  min_pseudo_conf: 0.5
+
+  # Cost过滤参数（Semi-DETR核心）
+  cost_alpha: 1.0
+  cost_beta: 6.0
 
   use_gmm_filtering: true
   covariance_type: 'full'
 
   # EMA更新参数
-  ema_decay: 0.999
+  ema_decay: 0.9995
+
+  # 分阶段混合匹配参数（Semi-DETR核心）
+  warm_up_step: 60000
 
   # 无监督损失权重（保守设置）
-  burn_up_steps: 15000
-  initial_unsup_weight: 0.005
-  max_unsup_weight: 0.015  # 降低最大权重
+  burn_up_steps: 10000
+  initial_unsup_weight: 0.01
+  max_unsup_weight: 0.03
   weight_increment: 0.0
   steps_per_epoch: 1479
 

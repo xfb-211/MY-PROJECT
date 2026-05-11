@@ -109,7 +109,8 @@ class SemiRTDETRTrainer(RTDETRTrainer):
 
         self.semi_loss_fn = SemiRTDETRLoss(
             num_classes=semi_cfg["num_classes"],
-            device=device
+            device=device,
+            warm_up_step=semi_cfg.get("warm_up_step", 60000)
         ).to(device)
 
         self.burn_up_steps = semi_cfg.get("burn_up_steps", 10000)
