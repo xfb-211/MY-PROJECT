@@ -195,7 +195,6 @@ class RTDETR_Semi(Model):
         :return: (total_loss, loss_dict)
         """
         self._update_unsup_weight()
-
         teacher1 = self._modules['_teacher1']
         teacher2 = self._modules['_teacher2']
         dual_fusion = self._modules['_dual_teacher_fusion']
@@ -203,26 +202,30 @@ class RTDETR_Semi(Model):
         semi_loss_fn = self._modules['_semi_loss_fn']
 
         # ========== 1. 监督分支 ==========
-        sup_targets = semi_loss_fn._build_sup_targets(gt_boxes, gt_labels)
         pred_sup = self.model(x_sup)
+        # RT-DETR训练模式输出：(dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta) (5个元素)
+        # RT-DETR评估模式输出：(y_tensor, (dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta)) (2个元素)
+        # 统一提取(dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta)部分
         if isinstance(pred_sup, tuple) and len(pred_sup) == 2:
             pred_sup = pred_sup[1]
+
         sup_loss, sup_dict = semi_loss_fn(
             self.model, pred_sup, gt_boxes=gt_boxes, gt_labels=gt_labels,
             is_supervised=True
         )
+        # 应用监督损失权重
+        sup_loss = sup_loss * self.semi_config.get("sup_loss_weight", 1.0)
 
         # ========== 2. 伪标签生成 ==========
         with torch.no_grad():
             x_unsup_flip = torch.flip(x_unsup, dims=[3])
-
             # 教师模型推理 - 直接调用forward
             teacher1.eval()
             teacher2.eval()
             t1_out = teacher1(x_unsup)
             t2_out = teacher2(x_unsup_flip)
 
-            # 处理输出格式
+            # 统一处理教师模型输出格式
             if isinstance(t1_out, tuple) and len(t1_out) == 2:
                 t1_out = t1_out[1]
             if isinstance(t2_out, tuple) and len(t2_out) == 2:
@@ -231,19 +234,14 @@ class RTDETR_Semi(Model):
             # 统一为5元组格式
             t1_out_full = (t1_out[0], t1_out[1], None, None, None)
             t2_out_full = (t2_out[0], t2_out[1], None, None, None)
-
             pseudo_boxes, pseudo_labels, pseudo_mask = pseudo_gen(
                 t1_out_full, t2_out_full, flipped=True
             )
 
         # ========== 3. 无监督分支 ==========
-        pseudo_targets = semi_loss_fn._build_pseudo_targets(
-            pseudo_boxes, pseudo_labels, pseudo_mask
-        )
         unsup_loss = torch.tensor(0.0, device=x_sup.device)
         unsup_dict = {}
-
-        if pseudo_targets is not None:
+        if pseudo_mask.sum() > 0:
             pred_unsup = self.model(x_unsup)
             if isinstance(pred_unsup, tuple) and len(pred_unsup) == 2:
                 pred_unsup = pred_unsup[1]
@@ -256,8 +254,7 @@ class RTDETR_Semi(Model):
         # ========== 4. 特征扰动分支 ==========
         fp_loss = torch.tensor(0.0, device=x_sup.device)
         fp_dict = {}
-
-        if pseudo_targets is not None:
+        if pseudo_mask.sum() > 0:
             with torch.no_grad():
                 features = []
                 y = []
@@ -268,12 +265,12 @@ class RTDETR_Semi(Model):
                             [x_fp if j == -1 else y[j] for j in m.f]
                     x_fp = m(x_fp)
                     y.append(x_fp if m.i in self.model.save else None)
-
                 head_inputs = [y[j] for j in self.model.model[-1].f]
                 head_inputs = [self.dropblock(f) for f in head_inputs]
 
             head = self.model.model[-1]
-            pred_fp = head(head_inputs, batch=pseudo_targets)
+            pred_fp = head(head_inputs)
+            # 特征扰动分支输出是head直接输出的5元组，无需额外处理
             fp_loss, fp_dict = semi_loss_fn(
                 self.model, pred_fp,
                 pseudo_boxes=pseudo_boxes, pseudo_labels=pseudo_labels,
@@ -282,14 +279,16 @@ class RTDETR_Semi(Model):
 
         # ========== 5. 总损失 ==========
         current_unsup_weight = semi_loss_fn.unsup_weight
+        # 总损失 = 监督损失 + 无监督损失权重 * (无监督损失 + 特征扰动损失)/2
         total_loss = sup_loss + current_unsup_weight * (unsup_loss + fp_loss) / 2
 
         loss_dict = {**sup_dict, **unsup_dict, **{f"fp_{k}": v for k, v in fp_dict.items()}}
         loss_dict["total_loss"] = total_loss
 
+        # 更新双教师模型
         dual_fusion.update_teachers(teacher1, teacher2, self.model)
-
         self._pseudo_count = pseudo_mask.sum().item()
+
         return total_loss, loss_dict
 
 

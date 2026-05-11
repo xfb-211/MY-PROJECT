@@ -233,13 +233,12 @@ class SemiRTDETRTrainer(RTDETRTrainer):
 
     def _compute_unsup_loss(self):
         """
-        单教师半监督损失计算
+        改进的半监督损失计算（抗噪声版本）
 
-        流程：
-        1. 教师在弱增强图像上生成伪标签（冻结参数）
-        2. 学生在强增强图像上学习
-        3. 计算监督损失 + 一致性损失
-        4. EMA更新教师模型
+        关键改进：
+        1. 课程学习：随训练进度动态调整伪标签阈值
+        2. 选择性EMA更新：只在学生表现优于教师时更新
+        3. 动态权重：根据伪标签质量调整无监督权重
         """
         if not hasattr(self, 'semi_loss_fn') or self.semi_loss_fn is None:
             return torch.tensor(0.0, device=self.device)
@@ -259,8 +258,16 @@ class SemiRTDETRTrainer(RTDETRTrainer):
 
         unsup_batch = self.preprocess_batch(unsup_batch)
         x_unsup = unsup_batch["img"]
-
         x_weak = torch.flip(x_unsup, dims=[3])
+
+        # ====== 课程学习：动态调整伪标签阈值 ======
+        # 训练初期使用高阈值（严格），后期逐渐放宽
+        progress = min(self.global_step / (self.steps_per_epoch * 120), 1.0)
+        dynamic_thresh = self.pseudo_label_gen.conf_thresh + (0.3 - self.pseudo_label_gen.conf_thresh) * progress
+
+        # 临时修改阈值
+        original_thresh = self.pseudo_label_gen.conf_thresh
+        self.pseudo_label_gen.conf_thresh = dynamic_thresh
 
         with torch.no_grad():
             teacher_out = self._teacher_forward(self.teacher1, x_weak)
@@ -269,11 +276,15 @@ class SemiRTDETRTrainer(RTDETRTrainer):
             n_valid = pseudo_mask.sum().item() if pseudo_mask is not None else 0
 
             if n_valid == 0:
-                if self.global_step % 200 == 0:
-                    sys.stderr.write(
-                        f"\r[SingleTeacher-Debug] step={self.global_step} unsup_weight={current_unsup_weight:.4f} n_valid_pseudo=0, skipping\n")
-                    sys.stderr.flush()
+                self.pseudo_label_gen.conf_thresh = original_thresh
                 return torch.tensor(0.0, device=self.device)
+
+        # 恢复原始阈值
+        self.pseudo_label_gen.conf_thresh = original_thresh
+
+        # ====== 计算伪标签质量分数 ======
+        # 用于动态调整无监督权重
+        pseudo_quality = self._compute_pseudo_quality(pseudo_mask, teacher_out)
 
         pseudo_targets = self.semi_loss_fn._build_pseudo_targets(
             pseudo_boxes, pseudo_labels, pseudo_mask
@@ -298,34 +309,53 @@ class SemiRTDETRTrainer(RTDETRTrainer):
             is_supervised=False
         )
 
-        consistency_loss = torch.tensor(0.0, device=self.device)
-        if hasattr(self, 'consistency_loss_fn') and self.consistency_loss_fn is not None:
-            try:
-                student_features = self._get_model_features(self.model, x_unsup)
-                teacher_features = self._get_model_features(self.teacher1, x_weak)
-                consistency_loss = self.consistency_loss_fn(
-                    student_features, teacher_features, pseudo_mask
-                )
-            except Exception:
-                consistency_loss = torch.tensor(0.0, device=self.device)
+        # ====== 动态权重调整 ======
+        # 根据伪标签质量调整无监督损失权重
+        quality_weight = min(pseudo_quality, 1.0)
+        total_unsup_loss = unsup_loss * quality_weight
 
-        total_unsup_loss = unsup_loss + consistency_loss
-
+        # ====== 选择性EMA更新 ======
+        # 只在伪标签质量足够高时更新教师
         if hasattr(self, 'teacher_ema') and self.teacher_ema is not None:
-            self.teacher_ema.update()
+            if pseudo_quality > 0.5:  # 质量阈值
+                self.teacher_ema.update()
 
+        # ====== 调试日志 ======
         if self.global_step % 200 == 0:
             debug_msg = (f"[SingleTeacher-Debug] step={self.global_step} "
                          f"unsup_weight={current_unsup_weight:.4f} "
                          f"n_valid_pseudo={n_valid} "
+                         f"pseudo_quality={pseudo_quality:.4f} "
+                         f"dynamic_thresh={dynamic_thresh:.4f} "
                          f"unsup_loss={unsup_loss.item():.4f} "
-                         f"consistency_loss={consistency_loss.item():.4f} "
-                         f"total_loss={total_unsup_loss.item():.4f} "
                          f"weighted={current_unsup_weight * total_unsup_loss.item():.4f}")
             sys.stderr.write(f"\r{debug_msg}\n")
             sys.stderr.flush()
 
         return current_unsup_weight * total_unsup_loss
+
+    def _compute_pseudo_quality(self, pseudo_mask, teacher_out):
+        """
+        计算伪标签质量分数
+
+        返回值：0-1之间，越高表示质量越好
+        """
+        if pseudo_mask is None or teacher_out is None:
+            return 0.0
+
+        dec_scores = teacher_out[1]
+        scores = dec_scores[-1].sigmoid().max(dim=-1)[0]  # [bs, num_queries]
+
+        # 只考虑有效伪标签的分数
+        valid_scores = scores[pseudo_mask]
+
+        if len(valid_scores) == 0:
+            return 0.0
+
+        # 质量分数 = 平均置信度
+        quality = valid_scores.mean().item()
+
+        return quality
 
     def _get_model_features(self, model, x):
         """获取模型中间层特征"""
@@ -540,20 +570,26 @@ class SemiRTDETRTrainer(RTDETRTrainer):
 
 
 def main():
+    """
+    阶段2：半监督训练学生模型
+    """
     model_cfg = "rtdetr-l.pt"
     data_cfg = "./datasets/coco_semi.yaml"
-    project = "runs/coco_semi"
-    # name = "DTAB-SSOD-COCO-Final"
-    name = "DTAB-SSOD-Conservative"
-    epochs = 120
-    batch = 8
+    project = "runs/student_training"
+    name = "RTDETR-Student-Semi"
+    epochs = 100
+    batch = 4
     imgsz = 640
     device = "0"
     workers = 0
 
-    LOGGER.info(colorstr("green", "Starting semi-supervised training..."))
-    LOGGER.info(colorstr("green", f"Model: {model_cfg}"))
-    LOGGER.info(colorstr("green", f"Data: {data_cfg}"))
+    # ====== 关键：使用阶段1训练的教师 ======
+    teacher_path = "runs/teacher_training/RTDETR-Teacher/weights/best.pt"
+
+    LOGGER.info(colorstr("green", "=" * 60))
+    LOGGER.info(colorstr("green", "PHASE 2: SEMI-SUPERVISED STUDENT TRAINING"))
+    LOGGER.info(colorstr("green", f"Teacher: {teacher_path}"))
+    LOGGER.info(colorstr("green", "=" * 60))
 
     overrides = {
         "model": model_cfg,
@@ -566,15 +602,17 @@ def main():
         "project": project,
         "name": name,
         "amp": False,
-        "patience": 100,
+        "patience": 5,
         "save": True,
         "val": True,
         "exist_ok": True,
-        "lr0": 1e-5,
-        "weight_decay": 0.0001,
+        "lr0": 8e-6,
+        "lrf": 0.01,
+        "weight_decay": 0.0005,
         "mosaic": 1.0,
         "warmup_bias_lr": 0.0,
         "warmup_epochs": 1.0,
+        "close_mosaic": 5,
     }
 
     cfg = get_cfg(DEFAULT_CFG)

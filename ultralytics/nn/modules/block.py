@@ -2164,7 +2164,6 @@ class PseudoLabelGenerator(nn.Module):
                 all_scores_tensor = torch.stack(all_scores) if isinstance(all_scores[0],
                                                                           torch.Tensor) else torch.tensor(all_scores,
                                                                                                           device=device)
-
                 if self.use_gmm_filtering and self.skm is not None and len(all_scores) >= 5:
                     # GMM自适应阈值
                     cost_thr = self._fit_gmm(all_scores_tensor, device)
@@ -2181,14 +2180,13 @@ class PseudoLabelGenerator(nn.Module):
                 all_boxes = [all_boxes[i] for i in range(len(all_boxes)) if valid_idx[i]]
                 all_labels = [all_labels[i] for i in range(len(all_labels)) if valid_idx[i]]
 
-            num_queries = 300
+            # 动态获取num_queries（从教师模型输出形状，避免硬编码）
+            num_queries = dec_bboxes1.shape[1]
             num_valid = min(len(all_boxes), num_queries)
             mask = torch.zeros(num_queries, dtype=torch.bool, device=device)
             mask[:num_valid] = True
-
             pad_boxes = torch.zeros((num_queries, 4), device=device)
             pad_labels = torch.zeros(num_queries, dtype=torch.long, device=device)
-
             if num_valid > 0:
                 for i in range(num_valid):
                     pad_boxes[i] = all_boxes[i]
@@ -2329,62 +2327,59 @@ class SingleTeacherPseudoLabelGenerator(nn.Module):
             self.skm = None
             LOGGER.warning("[SingleTeacher] sklearn not installed, GMM disabled")
 
+    # 替换block.py中整个SingleTeacherPseudoLabelGenerator.forward方法
     @torch.no_grad()
     def forward(self, teacher_out):
         """
-        从教师输出生成伪标签
-        teacher_out: (dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta)
+        改进的伪标签生成（增加质量过滤）
         """
         dec_bboxes, dec_scores = teacher_out[0], teacher_out[1]
         boxes = dec_bboxes[-1]
         scores = dec_scores[-1]
-
         batch_size = boxes.shape[0]
         device = boxes.device
-
         final_boxes = []
         final_labels = []
         final_masks = []
-
         for b in range(batch_size):
             scores_b = scores[b].sigmoid().max(dim=-1)[0]
             labels_b = scores[b].argmax(dim=-1)
             boxes_b = boxes[b]
-
+            # 第一次过滤：当前置信度阈值
             keep_mask = scores_b >= self.conf_thresh
             scores_keep = scores_b[keep_mask]
             labels_keep = labels_b[keep_mask]
             boxes_keep = boxes_b[keep_mask]
-
             if len(scores_keep) == 0:
                 num_queries = boxes.shape[1]
                 final_boxes.append(torch.zeros((num_queries, 4), device=device))
                 final_labels.append(torch.zeros(num_queries, dtype=torch.long, device=device))
                 final_masks.append(torch.zeros(num_queries, dtype=torch.bool, device=device))
                 continue
-
+            # 第二次过滤：GMM自适应阈值
             valid_mask = self._apply_quality_filter(scores_keep, device)
-
             scores_final = scores_keep[valid_mask]
             labels_final = labels_keep[valid_mask]
             boxes_final = boxes_keep[valid_mask]
-
+            # 第三次过滤：移除低质量框
+            # 只保留置信度排名前N的伪标签
+            max_pseudo = min(len(boxes_final), 100)  # 限制最大数量
+            if len(scores_final) > max_pseudo:
+                top_idx = torch.argsort(scores_final, descending=True)[:max_pseudo]
+                boxes_final = boxes_final[top_idx]
+                labels_final = labels_final[top_idx]
             num_queries = boxes.shape[1]
             num_valid = min(len(boxes_final), num_queries)
-
             pad_boxes = torch.zeros((num_queries, 4), device=device)
             pad_labels = torch.zeros(num_queries, dtype=torch.long, device=device)
             mask = torch.zeros(num_queries, dtype=torch.bool, device=device)
-
             if num_valid > 0:
                 pad_boxes[:num_valid] = boxes_final[:num_valid]
                 pad_labels[:num_valid] = labels_final[:num_valid]
                 mask[:num_valid] = True
-
             final_boxes.append(pad_boxes)
             final_labels.append(pad_labels)
             final_masks.append(mask)
-
         return (
             torch.stack(final_boxes),
             torch.stack(final_labels),
@@ -2426,10 +2421,8 @@ class SingleTeacherPseudoLabelGenerator(nn.Module):
 class MeanTeacherEMA(nn.Module):
     """
     Mean Teacher EMA更新
-
     使用指数移动平均将学生权重同步到教师模型
     """
-
     def __init__(self, teacher_model, student_model, decay=0.999, device='cuda'):
         super().__init__()
         self.teacher = teacher_model
@@ -2439,10 +2432,10 @@ class MeanTeacherEMA(nn.Module):
         self._init_teacher_from_student()
 
     def _init_teacher_from_student(self):
-        """从学生模型初始化教师模型"""
-        for t_param, s_param in zip(self.teacher.parameters(), self.student.parameters()):
-            t_param.data.copy_(s_param.data)
-            t_param.requires_grad = False
+        """从学生模型初始化教师模型（使用state_dict确保所有参数正确复制）"""
+        self.teacher.load_state_dict(self.student.state_dict())
+        for p in self.teacher.parameters():
+            p.requires_grad = False
 
     @torch.no_grad()
     def update(self):
@@ -2458,13 +2451,11 @@ class MeanTeacherEMA(nn.Module):
         self.teacher.eval()
         return super().eval()
 
-
 # ===================== 一致性损失模块 =====================
 class ConsistencyLoss(nn.Module):
     """
     一致性损失：对比去噪查询 + 跨视图特征对齐
     """
-
     def __init__(self, temperature=0.1, loss_weight=1.0):
         super().__init__()
         self.temperature = temperature
@@ -2474,41 +2465,31 @@ class ConsistencyLoss(nn.Module):
         """计算一致性损失"""
         if student_features is None or teacher_features is None:
             return torch.tensor(0.0, device='cpu')
-
         total_loss = 0.0
         count = 0
-
         for s_feat, t_feat in zip(student_features, teacher_features):
             s_flat = s_feat.flatten(2).transpose(1, 2)
             t_flat = t_feat.flatten(2).transpose(1, 2)
-
             s_norm = F.normalize(s_flat, p=2, dim=-1)
             t_norm = F.normalize(t_flat, p=2, dim=-1)
-
             similarity = torch.matmul(s_norm, t_norm.transpose(1, 2)) / self.temperature
-
             batch_size = similarity.shape[0]
             labels = torch.arange(similarity.shape[1], device=similarity.device)
             labels = labels.unsqueeze(0).expand(batch_size, -1)
-
             loss = F.cross_entropy(similarity.view(-1, similarity.size(-1)), labels.view(-1))
-
             if pseudo_mask is not None:
                 pseudo_mask_flat = pseudo_mask.flatten().float()
                 if pseudo_mask_flat.sum() > 0:
                     loss = loss * pseudo_mask_flat.mean()
-
             total_loss += loss
             count += 1
-
         return self.loss_weight * (total_loss / max(count, 1))
-
 
 class SemiRTDETRLoss(nn.Module):
     """
     半监督损失计算模块，复用RT-DETR原生RTDETRDetectionLoss
+    注意：返回的损失是原始损失，未乘以权重，权重在外部统一处理
     """
-
     def __init__(self, num_classes: int, device="cuda"):
         super().__init__()
         self.num_classes = num_classes
@@ -2540,7 +2521,6 @@ class SemiRTDETRLoss(nn.Module):
         统一损失计算入口，复用RT-DETR原生criterion
         """
         self._init_criterion(model)
-
         total_loss = 0.0
         loss_dict = {}
 
@@ -2550,17 +2530,17 @@ class SemiRTDETRLoss(nn.Module):
             sum_loss = sum(loss.values())
             loss_dict = {f"sup_{k}": v for k, v in loss.items()}
             loss_dict["sup_total_loss"] = sum_loss
-            total_loss += self.sup_weight * sum_loss
+            total_loss = sum_loss
 
         elif not is_supervised and pseudo_boxes is not None and pseudo_mask is not None:
             targets = self._build_pseudo_targets(pseudo_boxes, pseudo_labels, pseudo_mask)
             if targets is not None:
                 loss = self.criterion((preds[0], preds[1]), targets)
-                sum_loss = sum(loss.values()) * self.unsup_weight
-                ud = {f"unsup_{k}": v * self.unsup_weight for k, v in loss.items()}
+                sum_loss = sum(loss.values())
+                ud = {f"unsup_{k}": v for k, v in loss.items()}
                 ud["unsup_total_loss"] = sum_loss
                 loss_dict.update(ud)
-                total_loss += sum_loss
+                total_loss = sum_loss
 
         loss_dict["total_loss"] = total_loss
         return total_loss, loss_dict
@@ -2574,7 +2554,6 @@ class SemiRTDETRLoss(nn.Module):
         all_cls = []
         all_bboxes = []
         all_batch_idx = []
-
         for b in range(bs):
             valid = gt_labels[b] != -1
             num_valid = valid.sum().item()
@@ -2606,18 +2585,26 @@ class SemiRTDETRLoss(nn.Module):
     def _build_pseudo_targets(self, pseudo_boxes, pseudo_labels, pseudo_mask):
         """
         将伪标签转换为RT-DETR criterion所需的targets格式
+        关键修复：将RT-DETR输出的xyxy格式转换为criterion需要的xywh格式
         """
         bs = pseudo_boxes.shape[0]
         all_cls = []
         all_bboxes = []
         all_batch_idx = []
-
         for b in range(bs):
             mask = pseudo_mask[b]
             num_valid = mask.sum().item()
             if num_valid > 0:
                 all_cls.append(pseudo_labels[b, mask])
-                all_bboxes.append(pseudo_boxes[b, mask])
+                # 坐标转换：xyxy -> xywh (RT-DETR输出是xyxy，criterion需要xywh)
+                xyxy = pseudo_boxes[b, mask]
+                x1, y1, x2, y2 = xyxy.unbind(-1)
+                cx = (x1 + x2) / 2
+                cy = (y1 + y2) / 2
+                w = x2 - x1
+                h = y2 - y1
+                xywh = torch.stack([cx, cy, w, h], dim=-1)
+                all_bboxes.append(xywh)
                 all_batch_idx.append(torch.full((num_valid,), b, dtype=torch.long, device=pseudo_boxes.device))
 
         if len(all_cls) == 0:
