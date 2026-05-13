@@ -298,13 +298,14 @@ class SemiRTDETRTrainer(RTDETRTrainer):
         )
 
         consistency_loss = self._compute_query_consistency_loss(pred_unsup, teacher_out, pseudo_mask)
-        total_unsup_loss = unsup_loss + 0.1 * consistency_loss
+        # 提高一致性损失权重
+        total_unsup_loss = unsup_loss + 0.2 * consistency_loss
 
         if hasattr(self, 'teacher_ema') and self.teacher_ema is not None:
             self.teacher_ema.update()
 
-        if self.global_step % 200 == 0:
-            debug_msg = (f"[SemiDETR-Debug] step={self.global_step} "
+        if self.global_step % 400 == 0:
+            debug_msg = (f"[Semi] step={self.global_step} "
                          f"unsup_weight={current_unsup_weight:.4f} "
                          f"quality_factor={quality_factor:.4f} "
                          f"n_valid_pseudo={n_valid} "
@@ -625,7 +626,7 @@ def main():
         "project": project,
         "name": name,
         "amp": False,
-        "patience": 20,
+        "patience": 50,
         "save": True,
         "val": True,
         "exist_ok": True,
