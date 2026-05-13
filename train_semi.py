@@ -298,8 +298,18 @@ class SemiRTDETRTrainer(RTDETRTrainer):
         )
 
         consistency_loss = self._compute_query_consistency_loss(pred_unsup, teacher_out, pseudo_mask)
-        # 提高一致性损失权重
+
+        # 确保unsup_loss是tensor且非负
+        if not isinstance(unsup_loss, torch.Tensor):
+            unsup_loss = torch.tensor(unsup_loss, device=self.device)
+        unsup_loss = unsup_loss.clamp(min=0.0, max=10.0)
+
+        if not isinstance(consistency_loss, torch.Tensor):
+            consistency_loss = torch.tensor(consistency_loss, device=self.device)
+        consistency_loss = consistency_loss.clamp(min=0.0, max=5.0)
+
         total_unsup_loss = unsup_loss + 0.2 * consistency_loss
+        total_unsup_loss = total_unsup_loss.clamp(min=0.0, max=15.0)
 
         if hasattr(self, 'teacher_ema') and self.teacher_ema is not None:
             self.teacher_ema.update()
@@ -315,7 +325,11 @@ class SemiRTDETRTrainer(RTDETRTrainer):
             sys.stderr.write(f"\r{debug_msg}\n")
             sys.stderr.flush()
 
-        return current_unsup_weight * quality_factor * total_unsup_loss
+        # 转换为标量并限制范围
+        total_unsup_loss_scalar = total_unsup_loss.item() * current_unsup_weight * quality_factor
+        total_unsup_loss_scalar = max(0.0, min(total_unsup_loss_scalar, 15.0))
+
+        return torch.tensor(total_unsup_loss_scalar, device=self.device, requires_grad=True)
 
     def _compute_query_consistency_loss(self, student_out, teacher_out, pseudo_mask):
         """计算跨视图查询一致性损失"""
