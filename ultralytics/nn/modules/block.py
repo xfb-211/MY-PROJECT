@@ -2227,17 +2227,20 @@ class SemiRTDETRLoss(nn.Module):
 
         pos_boxes = pred_boxes[pos_inds]
         pos_gt_boxes = gt_boxes[assigned_gt_inds[pos_inds] - 1]
-        pos_labels = assigned_labels[pos_inds]
+        pos_labels = assigned_labels[pos_inds].clamp(0, self.num_classes - 1)
 
         loss_bbox = F.l1_loss(pos_boxes, pos_gt_boxes, reduction='mean')
+        
+        loss_giou = 1 - self._compute_giou(pos_boxes, pos_gt_boxes).mean()
 
         pos_scores = pred_scores[pos_inds]
-        loss_cls = F.binary_cross_entropy_with_logits(
-            pos_scores,
-            F.one_hot(pos_labels, num_classes=self.num_classes).float()
-        )
+        target_cls = torch.zeros_like(pos_scores)
+        for i, label in enumerate(pos_labels):
+            if label < self.num_classes:
+                target_cls[i, label] = 1.0
+        loss_cls = F.binary_cross_entropy_with_logits(pos_scores, target_cls)
 
-        return loss_bbox + 0.5 * loss_cls
+        return loss_bbox + loss_giou + 0.5 * loss_cls
 
     def _compute_o2o_loss(self, pred_boxes, pred_scores, gt_boxes, gt_labels):
         alignment_cost = self._compute_alignment_cost(pred_boxes, pred_scores, gt_boxes, gt_labels)
@@ -2252,27 +2255,29 @@ class SemiRTDETRLoss(nn.Module):
         except ImportError:
             row_inds, col_inds = np.arange(len(pred_boxes)), np.zeros(len(pred_boxes), dtype=int)
 
-        valid_mask = alignment_cost[row_inds, col_inds] > 0.1
+        valid_mask = alignment_cost[row_inds, col_inds] > 0.05
         row_inds = row_inds[valid_mask]
         col_inds = col_inds[valid_mask]
 
-        pos_inds = torch.tensor(row_inds, device=pred_boxes.device)
-        if len(pos_inds) == 0:
+        if len(row_inds) == 0:
             return torch.tensor(0.0, device=self.device)
 
-        pos_boxes = pred_boxes[pos_inds]
+        pos_boxes = pred_boxes[row_inds]
         pos_gt_boxes = gt_boxes[col_inds]
-        pos_labels = gt_labels[col_inds]
+        pos_labels = gt_labels[col_inds].clamp(0, self.num_classes - 1)
 
         loss_bbox = F.l1_loss(pos_boxes, pos_gt_boxes, reduction='mean')
+        
+        loss_giou = 1 - self._compute_giou(pos_boxes, pos_gt_boxes).mean()
 
-        pos_scores = pred_scores[pos_inds]
-        loss_cls = F.binary_cross_entropy_with_logits(
-            pos_scores,
-            F.one_hot(pos_labels, num_classes=self.num_classes).float()
-        )
+        pos_scores = pred_scores[row_inds]
+        target_cls = torch.zeros_like(pos_scores)
+        for i, label in enumerate(pos_labels):
+            if label < self.num_classes:
+                target_cls[i, label] = 1.0
+        loss_cls = F.binary_cross_entropy_with_logits(pos_scores, target_cls)
 
-        return loss_bbox + 0.5 * loss_cls
+        return loss_bbox + loss_giou + 0.5 * loss_cls
 
     def _compute_alignment_cost(self, pred_boxes, pred_scores, gt_boxes, gt_labels):
         num_gts = len(gt_boxes)
@@ -2285,6 +2290,24 @@ class SemiRTDETRLoss(nn.Module):
 
         alignment_cost = (cls_scores ** self.alpha) * (ious ** self.beta)
         return alignment_cost
+
+    def _compute_giou(self, boxes1, boxes2):
+        area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
+        area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
+
+        lt = torch.max(boxes1[:, :2], boxes2[:, :2])
+        rb = torch.min(boxes1[:, 2:], boxes2[:, 2:])
+        inter = (rb - lt).clamp(min=0).prod(dim=1)
+        union = area1 + area2 - inter
+
+        iou = inter / (union + 1e-7)
+
+        lt_c = torch.min(boxes1[:, :2], boxes2[:, :2])
+        rb_c = torch.max(boxes1[:, 2:], boxes2[:, 2:])
+        area_c = (rb_c - lt_c).clamp(min=0).prod(dim=1)
+
+        giou = iou - (area_c - union) / (area_c + 1e-7)
+        return giou
 
     def _one_to_many_assign(self, alignment_cost, gt_labels):
         num_preds, num_gts = alignment_cost.shape
