@@ -70,26 +70,27 @@ class SemiRTDETRTrainer(RTDETRTrainer):
 
         try:
             if not os.path.exists(teacher1_path):
-                teacher1_path = "rtdetr-l.pt"
-
-            LOGGER.info(f"[SemiRTDETR] Loading teacher from: {teacher1_path}")
-            ckpt1 = torch.load(teacher1_path, map_location=device, weights_only=False)
-            self.teacher1 = ckpt1['model'].float().eval() \
-                if isinstance(ckpt1, dict) and 'model' in ckpt1 else ckpt1.float().eval()
-            self.teacher1 = self.teacher1.to(device)
+                LOGGER.warning(f"[SemiRTDETR] Teacher path {teacher1_path} not found, cloning student")
+                self.teacher1 = copy.deepcopy(self.model)
+            else:
+                LOGGER.info(f"[SemiRTDETR] Loading teacher from: {teacher1_path}")
+                ckpt1 = torch.load(teacher1_path, map_location=device, weights_only=False)
+                self.teacher1 = ckpt1['model'].float().eval() \
+                    if isinstance(ckpt1, dict) and 'model' in ckpt1 else ckpt1.float().eval()
+                self.teacher1 = self.teacher1.to(device)
 
             for p in self.teacher1.parameters():
                 p.requires_grad_(False)
 
         except Exception as e:
-            LOGGER.warning(f"[SemiRTDETR] Failed to load teacher: {e}")
+            LOGGER.warning(f"[SemiRTDETR] Error loading teacher, cloning student: {e}")
             self.teacher1 = copy.deepcopy(self.model)
             for p in self.teacher1.parameters():
                 p.requires_grad_(False)
 
         self.pseudo_label_gen = SingleTeacherPseudoLabelGenerator(
-            conf_thresh=semi_cfg.get("conf_thresh", 0.5),
-            min_pseudo_conf=semi_cfg.get("min_pseudo_conf", 0.5),
+            conf_thresh=semi_cfg.get("conf_thresh", 0.25),
+            min_pseudo_conf=semi_cfg.get("min_pseudo_conf", 0.25),
             use_gmm_filtering=semi_cfg.get("use_gmm_filtering", True),
             covariance_type=semi_cfg.get("covariance_type", "full"),
             cost_alpha=semi_cfg.get("cost_alpha", 1.0),
@@ -100,9 +101,12 @@ class SemiRTDETRTrainer(RTDETRTrainer):
         self.teacher_ema = MeanTeacherEMA(
             teacher_model=self.teacher1,
             student_model=self.model,
-            decay=semi_cfg.get("ema_decay", 0.9995),
+            decay=semi_cfg.get("ema_decay", 0.9996),
+            warm_up=semi_cfg.get("ema_warm_up", 2000),
             device=device
         )
+        self.teacher_ema.eval()
+        self.teacher1.eval()
 
         self.semi_loss_fn = SemiRTDETRLoss(
             num_classes=semi_cfg["num_classes"],
@@ -110,10 +114,10 @@ class SemiRTDETRTrainer(RTDETRTrainer):
             warm_up_step=semi_cfg.get("warm_up_step", 60000)
         ).to(device)
 
-        self.burn_up_steps = semi_cfg.get("burn_up_steps", 10000)
-        self.initial_unsup_weight = semi_cfg.get("initial_unsup_weight", 0.01)
+        self.burn_up_steps = semi_cfg.get("burn_up_steps", 20000)
+        self.initial_unsup_weight = semi_cfg.get("initial_unsup_weight", 0.5)
         self.weight_increment = semi_cfg.get("weight_increment", 0.0)
-        self.max_unsup_weight = semi_cfg.get("max_unsup_weight", 0.03)
+        self.max_unsup_weight = semi_cfg.get("max_unsup_weight", 2.0)
         self.steps_per_epoch = semi_cfg.get("steps_per_epoch", 1479)
         self.global_step = 0
 
@@ -176,9 +180,9 @@ class SemiRTDETRTrainer(RTDETRTrainer):
         return loader
 
     def _update_unsup_weight(self):
-        """无监督权重退火 - 使用更激进的增长策略"""
+        """无监督权重退火 - 更激进增长策略"""
         self.global_step += 1
-        
+
         if self.global_step < self.burn_up_steps:
             new_weight = 0.0
         else:
@@ -186,7 +190,9 @@ class SemiRTDETRTrainer(RTDETRTrainer):
                 (self.global_step - self.burn_up_steps) / (3 * self.steps_per_epoch),
                 1.0
             )
-            new_weight = self.initial_unsup_weight + (1 - np.cos(progress * np.pi)) * 0.5 * (self.max_unsup_weight - self.initial_unsup_weight)
+            # 使用更激进的增长曲线
+            new_weight = self.initial_unsup_weight + (1 - np.cos(progress * np.pi)) * 0.5 * (
+                        self.max_unsup_weight - self.initial_unsup_weight)
             new_weight = min(new_weight, self.max_unsup_weight)
 
         self.semi_loss_fn.set_unsup_weight(new_weight)
@@ -252,7 +258,10 @@ class SemiRTDETRTrainer(RTDETRTrainer):
         x_weak = torch.flip(x_unsup, dims=[3])
 
         with torch.no_grad():
+            # 使用 EMA 教师模型
             ema_teacher = self.teacher_ema.teacher if hasattr(self, 'teacher_ema') and self.teacher_ema else self.teacher1
+            if ema_teacher.training:
+                ema_teacher.eval()
             teacher_out = self._teacher_forward(ema_teacher, x_weak)
             pseudo_boxes, pseudo_labels, pseudo_mask = self.pseudo_label_gen(teacher_out)
 
@@ -262,7 +271,8 @@ class SemiRTDETRTrainer(RTDETRTrainer):
                 return torch.tensor(0.0, device=self.device)
 
             pseudo_quality = self._compute_pseudo_quality(pseudo_mask, teacher_out)
-            quality_factor = min(pseudo_quality / 0.7, 1.0)
+            # 调整质量因子计算，降低阈值敏感性
+            quality_factor = min(pseudo_quality / 0.5, 1.0)
 
         pseudo_targets = self.semi_loss_fn._build_pseudo_targets(
             pseudo_boxes, pseudo_labels, pseudo_mask

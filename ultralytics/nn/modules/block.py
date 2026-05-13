@@ -2103,23 +2103,31 @@ class SingleTeacherPseudoLabelGenerator(nn.Module):
 
 # ===================== Mean Teacher EMA更新模块 =====================
 class MeanTeacherEMA(nn.Module):
-    def __init__(self, teacher_model, student_model, decay=0.9995, device='cuda'):
+    def __init__(self, teacher_model, student_model, decay=0.9996, device='cuda', warm_up=2000):
         super().__init__()
         self.teacher = teacher_model
         self.student = student_model
         self.decay = decay
         self.device = device
-        # ❌ 已删除：不要覆盖预训练教师模型的权重！
-        # self._init_teacher_from_student()
+        self.warm_up = warm_up
+        self.step = 0
 
         # 确保教师模型参数不可训练
         for p in self.teacher.parameters():
             p.requires_grad_(False)
 
+    def get_momentum(self):
+        """动态计算当前动量 - Warm-up期间快速跟随，之后稳定"""
+        if self.step < self.warm_up:
+            return min(self.decay, 1 - (1 + self.warm_up) / (self.step + 1 + self.warm_up))
+        return self.decay
+
     @torch.no_grad()
     def update(self):
+        self.step += 1
+        momentum = self.get_momentum()
         for t_param, s_param in zip(self.teacher.parameters(), self.student.parameters()):
-            t_param.data.mul_(self.decay).add_(s_param.data, alpha=1 - self.decay)
+            t_param.data.mul_(momentum).add_(s_param.data, alpha=1 - momentum)
 
     def train(self, mode=True):
         self.teacher.train(mode)
