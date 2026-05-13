@@ -483,18 +483,29 @@ class SemiRTDETRTrainer(RTDETRTrainer):
                     else:
                         loss, self.loss_items = self.model(batch)
 
-                    self.loss = loss.sum()
+                    # 关键修复：保持loss为tensor，不要sum！
+                    sup_loss = loss  # 保持tensor，用于backward
 
                     # 计算无监督损失 (无标签数据)
-                    unsup_loss = torch.tensor(0.0, device=self.device)
+                    unsup_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
                     if hasattr(self, 'semi_loss_fn') and self.semi_loss_fn is not None:
-                        unsup_loss = self._compute_unsup_loss()
+                        try:
+                            unsup_loss = self._compute_unsup_loss()
+                            if not isinstance(unsup_loss, torch.Tensor):
+                                unsup_loss = torch.tensor(unsup_loss, device=self.device, requires_grad=True)
+                            # 确保非负且有限
+                            unsup_loss = unsup_loss.clamp(min=0.0, max=20.0)
+                        except Exception as e:
+                            LOGGER.warning(f"[SemiRTDETR] Error computing unsup loss: {e}")
+                            unsup_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
 
                     # 关键：监督损失 + 无监督损失 = 总损失
-                    total_loss = self.loss + unsup_loss
+                    # 确保两者都是tensor且可以backward
+                    total_loss = sup_loss + unsup_loss
+                    total_loss = total_loss.clamp(min=0.0, max=50.0)
 
                     if RANK != -1:
-                        total_loss *= self.world_size
+                        total_loss = total_loss * self.world_size
                     self.tloss = self.loss_items if self.tloss is None else (self.tloss * i + self.loss_items) / (i + 1)
 
                 # Backward - 一次反向传播（包含监督 + 无监督）
