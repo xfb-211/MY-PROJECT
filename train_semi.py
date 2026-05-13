@@ -176,16 +176,17 @@ class SemiRTDETRTrainer(RTDETRTrainer):
         return loader
 
     def _update_unsup_weight(self):
-        """DTAB-SSOD改进版无监督权重退火"""
+        """无监督权重退火 - 使用更激进的增长策略"""
         self.global_step += 1
+        
         if self.global_step < self.burn_up_steps:
             new_weight = 0.0
         else:
             progress = min(
-                (self.global_step - self.burn_up_steps) / (2 * self.steps_per_epoch),
+                (self.global_step - self.burn_up_steps) / (3 * self.steps_per_epoch),
                 1.0
             )
-            new_weight = self.initial_unsup_weight + progress * (self.max_unsup_weight - self.initial_unsup_weight)
+            new_weight = self.initial_unsup_weight + (1 - np.cos(progress * np.pi)) * 0.5 * (self.max_unsup_weight - self.initial_unsup_weight)
             new_weight = min(new_weight, self.max_unsup_weight)
 
         self.semi_loss_fn.set_unsup_weight(new_weight)
@@ -230,15 +231,6 @@ class SemiRTDETRTrainer(RTDETRTrainer):
         return out
 
     def _compute_unsup_loss(self):
-        """
-        半监督损失计算（参考Semi-DETR）
-
-        关键改进：
-        1. 成本过滤伪标签
-        2. GMM自适应阈值
-        3. 分阶段混合匹配（O2M → O2O）
-        4. 跨视图查询一致性损失
-        """
         if not hasattr(self, 'semi_loss_fn') or self.semi_loss_fn is None:
             return torch.tensor(0.0, device=self.device)
 
@@ -260,13 +252,17 @@ class SemiRTDETRTrainer(RTDETRTrainer):
         x_weak = torch.flip(x_unsup, dims=[3])
 
         with torch.no_grad():
-            teacher_out = self._teacher_forward(self.teacher1, x_weak)
+            ema_teacher = self.teacher_ema.teacher if hasattr(self, 'teacher_ema') and self.teacher_ema else self.teacher1
+            teacher_out = self._teacher_forward(ema_teacher, x_weak)
             pseudo_boxes, pseudo_labels, pseudo_mask = self.pseudo_label_gen(teacher_out)
 
             n_valid = pseudo_mask.sum().item() if pseudo_mask is not None else 0
 
             if n_valid == 0:
                 return torch.tensor(0.0, device=self.device)
+
+            pseudo_quality = self._compute_pseudo_quality(pseudo_mask, teacher_out)
+            quality_factor = min(pseudo_quality / 0.7, 1.0)
 
         pseudo_targets = self.semi_loss_fn._build_pseudo_targets(
             pseudo_boxes, pseudo_labels, pseudo_mask
@@ -300,13 +296,15 @@ class SemiRTDETRTrainer(RTDETRTrainer):
         if self.global_step % 200 == 0:
             debug_msg = (f"[SemiDETR-Debug] step={self.global_step} "
                          f"unsup_weight={current_unsup_weight:.4f} "
+                         f"quality_factor={quality_factor:.4f} "
                          f"n_valid_pseudo={n_valid} "
+                         f"pseudo_quality={pseudo_quality:.4f} "
                          f"unsup_loss={unsup_loss.item():.4f} "
                          f"consistency_loss={consistency_loss.item():.4f}")
             sys.stderr.write(f"\r{debug_msg}\n")
             sys.stderr.flush()
 
-        return current_unsup_weight * total_unsup_loss
+        return current_unsup_weight * quality_factor * total_unsup_loss
 
     def _compute_query_consistency_loss(self, student_out, teacher_out, pseudo_mask):
         """计算跨视图查询一致性损失"""

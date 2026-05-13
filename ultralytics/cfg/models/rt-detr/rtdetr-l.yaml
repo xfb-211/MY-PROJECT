@@ -13,9 +13,9 @@ scales: # model compound scaling constants
 semi:
   teacher1_path: 'runs/teacher_training/RTDETR-Teacher/weights/best.pt'
 
-  # 伪标签阈值
-  conf_thresh: 0.5
-  min_pseudo_conf: 0.5
+  # 伪标签阈值（降低以获得更多伪标签）
+  conf_thresh: 0.3
+  min_pseudo_conf: 0.3
 
   # Cost过滤参数（Semi-DETR核心）
   cost_alpha: 1.0
@@ -25,15 +25,15 @@ semi:
   covariance_type: 'full'
 
   # EMA更新参数
-  ema_decay: 0.9995
+  ema_decay: 0.9996
 
   # 分阶段混合匹配参数（Semi-DETR核心）
   warm_up_step: 60000
 
-  # 无监督损失权重（保守设置）
-  burn_up_steps: 10000
-  initial_unsup_weight: 0.01
-  max_unsup_weight: 0.03
+  # 无监督损失权重（关键修改：增大权重，延长burn-in）
+  burn_up_steps: 15000
+  initial_unsup_weight: 0.05
+  max_unsup_weight: 0.3
   weight_increment: 0.0
   steps_per_epoch: 1479
 
