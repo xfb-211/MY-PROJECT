@@ -2109,12 +2109,12 @@ class MeanTeacherEMA(nn.Module):
         self.student = student_model
         self.decay = decay
         self.device = device
-        self._init_teacher_from_student()
+        # ❌ 已删除：不要覆盖预训练教师模型的权重！
+        # self._init_teacher_from_student()
 
-    def _init_teacher_from_student(self):
-        for t_param, s_param in zip(self.teacher.parameters(), self.student.parameters()):
-            t_param.data.copy_(s_param.data)
-            t_param.requires_grad = False
+        # 确保教师模型参数不可训练
+        for p in self.teacher.parameters():
+            p.requires_grad_(False)
 
     @torch.no_grad()
     def update(self):
