@@ -2286,27 +2286,32 @@ class SemiRTDETRLoss(nn.Module):
         except ImportError:
             row_inds, col_inds = np.arange(len(pred_boxes)), np.zeros(len(pred_boxes), dtype=int)
 
-        # 关键修复：所有操作在CPU/Numpy上完成
+        # 第1次过滤：全部在numpy上完成
         alignment_cost_np = alignment_cost.detach().cpu().numpy()
-        valid_mask = alignment_cost_np[row_inds, col_inds] > 0.01
-        row_inds = row_inds[valid_mask]
-        col_inds = col_inds[valid_mask]
+        valid_mask1 = alignment_cost_np[row_inds, col_inds] > 0.01
+        row_inds = row_inds[valid_mask1]
+        col_inds = col_inds[valid_mask1]
 
         if len(row_inds) == 0:
             return torch.tensor(0.0, device=self.device)
 
+        # 获取第一次过滤后的内容
         pos_boxes = pred_boxes[row_inds]
         pos_gt_boxes = gt_boxes[col_inds]
         pos_labels = gt_labels[col_inds]
 
-        # 过滤无效标签
-        valid_mask = (pos_labels >= 0) & (pos_labels < self.num_classes)
-        if valid_mask.sum() == 0:
+        # 第2次过滤：全部在torch上完成
+        valid_mask2 = (pos_labels >= 0) & (pos_labels < self.num_classes)
+        if valid_mask2.sum() == 0:
             return torch.tensor(0.0, device=self.device)
 
-        pos_boxes = pos_boxes[valid_mask]
-        pos_gt_boxes = pos_gt_boxes[valid_mask]
-        pos_labels = pos_labels[valid_mask]
+        pos_boxes = pos_boxes[valid_mask2]
+        pos_gt_boxes = pos_gt_boxes[valid_mask2]
+        pos_labels = pos_labels[valid_mask2]
+
+        # 关键修复：正确获取pos_scores - 需要重新从原始pred_scores获取
+        # 先用row_inds索引，再用valid_mask2
+        pos_scores = pred_scores[row_inds][valid_mask2]
 
         # L1 loss
         loss_bbox = F.l1_loss(pos_boxes, pos_gt_boxes, reduction='mean')
@@ -2316,7 +2321,6 @@ class SemiRTDETRLoss(nn.Module):
         loss_giou = 1 - giou.mean()
 
         # 分类损失
-        pos_scores = pred_scores[row_inds][valid_mask]
         target = torch.zeros_like(pos_scores)
         target.scatter_(1, pos_labels.unsqueeze(1), 1.0)
         loss_cls = F.binary_cross_entropy_with_logits(pos_scores, target, reduction='mean')
