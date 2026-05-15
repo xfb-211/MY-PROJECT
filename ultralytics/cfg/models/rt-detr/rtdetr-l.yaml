@@ -1,11 +1,10 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
-
-# Ultralytics RT-DETR-l hybrid object detection model with P3/8 - P5/32 outputs
+# Ultralytics RT-DETR-l hybrid object detection model with P2/4 - P5/32 outputs (4-scale)
 # Model docs: https://docs.ultralytics.com/models/rtdetr
 # Task docs: https://docs.ultralytics.com/tasks/detect
 
 # Parameters
-nc: 80 # number of classes (VisDrone)
+nc: 80  # number of classes (VisDrone)
 scales: # model compound scaling constants
   l: [1.00, 1.00, 1024]
 
@@ -13,11 +12,11 @@ scales: # model compound scaling constants
 semi:
   teacher1_path: 'runs/teacher_training/RTDETR-Teacher/weights/best.pt'
 
-  # 伪标签阈值（大幅降低以获得更多伪标签）
+  # 伪标签阈值
   conf_thresh: 0.25
   min_pseudo_conf: 0.25
 
-  # Cost过滤参数（Semi-DETR核心）
+  # Cost过滤参数
   cost_alpha: 1.0
   cost_beta: 6.0
 
@@ -28,87 +27,68 @@ semi:
   ema_decay: 0.9996
   ema_warm_up: 2000
 
-  # 分阶段混合匹配参数（Semi-DETR核心）
+  # 分阶段混合匹配参数
   warm_up_step: 60000
 
-  # 无监督损失权重（关键修改：大幅提高）
-  burn_up_steps: 20000
-  initial_unsup_weight: 0.5
-  max_unsup_weight: 2.0
+  # 无监督损失权重 - 关键修改！
+  burn_up_steps: 40000
+  initial_unsup_weight: 0.1
+  max_unsup_weight: 0.5
   weight_increment: 0.0
   steps_per_epoch: 1479
 
-## ======================== 半监督 / 双教师核心配置（改进版） ========================
-#semi:
-#  teacher1_path: 'runs/coco_pretrain_teacher/teacher1/weights/best.pt'
-#  teacher2_path: 'runs/coco_pretrain_teacher/teacher2/weights/best.pt'
-#
-#  # 伪标签阈值（降低以提高召回率）
-#  conf_thresh: 0.7
-#  cluster_iou: 0.5
-#  match_iou: 0.5
-#
-#  # 伪标签质量过滤
-#  use_pseudo_filtering: true
-#  use_gmm_filtering: true
-#  min_pseudo_conf: 0.7
-#  covariance_type: 'full'
-#
-#  use_dynamic_thresh: false
-#  small_obj_thresh_offset: 0.0
-#  small_obj_size_thresh: 0.0
-#  teacher_fusion_weight: [0.5, 0.5]
-#  sup_loss_weight: 1.0
-#
-#  # DropBlock参数
-#  dropblock_prob: 0.15
-#  dropblock_size: 7
-#  fp_loss_weight: 0.5
-#
-#  # DTAB-SSOD改进参数（大幅降低权重，延长burn-in）
-#  burn_up_steps: 15000
-#  unsup_loss_weight: 0.0
-#  warmup_steps: 15000
-#  initial_unsup_weight: 0.01
-#  weight_increment: 0.0
-#  max_unsup_weight: 0.04
-#  steps_per_epoch: 1479
-#  ema_decay: 0.9996
-#
-#  # 伪标签质量过滤
-#  max_class_ratio: 3.0
-#  nms_iou_thresh: 0.5
-
 backbone:
-  - [-1, 1, HGStem, [32, 48]] # 0-P2/4
-  - [-1, 6, HGBlock, [48, 128, 3]] # stage 1
-  - [-1, 1, DWConv, [128, 3, 2, 1, False]] # 2-P3/8
-  - [-1, 6, HGBlock, [96, 512, 3]] # stage 2
-  - [-1, 1, DWConv, [512, 3, 2, 1, False]] # 4-P3/16
+  - [-1, 1, HGStem, [32, 48]]  # 0-P2/4
+  - [-1, 6, HGBlock, [48, 128, 3]]  # stage 1
+  - [-1, 1, DWConv, [128, 3, 2, 1, False]]  # 2-P3/8
+  - [-1, 6, HGBlock, [96, 512, 3]]  # stage 2
+  - [-1, 1, DWConv, [512, 3, 2, 1, False]]  # 4-P3/16
   - [-1, 6, HGBlock, [192, 1024, 5, True, False]]
   - [-1, 6, HGBlock, [192, 1024, 5, True, True]]
-  - [-1, 6, HGBlock, [192, 1024, 5, True, True]] # stage 3
-  - [-1, 1, DWConv, [1024, 3, 2, 1, False]] # 8-P4/32
-  - [-1, 6, HGBlock, [384, 2048, 5, True, False]] # stage 4
+  - [-1, 6, HGBlock, [192, 1024, 5, True, True]]  # stage 3
+  - [-1, 1, DWConv, [1024, 3, 2, 1, False]]  # 8-P4/32
+  - [-1, 6, HGBlock, [384, 2048, 5, True, False]]  # stage 4
 
-# Head（保持不变）
+# Head（4尺度版本：P2-P5）
 head:
-  - [-1, 1, Conv, [256, 1, 1, None, 1, 1, False]] # 10 input_proj.2
+  - [-1, 1, Conv, [256, 1, 1, None, 1, 1, False]]  # 10 input_proj.2
   - [-1, 1, AIFI, [1024, 8]]
-  - [-1, 1, Conv, [256, 1, 1]] # 12, Y5, lateral_convs.0
+  - [-1, 1, Conv, [256, 1, 1]]  # 12, Y5, lateral_convs.0
+
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
-  - [7, 1, Conv, [256, 1, 1, None, 1, 1, False]] # 14 input_proj.1
+  - [7, 1, Conv, [256, 1, 1, None, 1, 1, False]]  # 14 input_proj.1
   - [[-2, -1], 1, Concat, [1]]
-  - [-1, 3, RepC3, [256]] # 16, fpn_blocks.0
-  - [-1, 1, Conv, [256, 1, 1]] # 17, Y4, lateral_convs.1
+  - [-1, 3, RepC3, [256]]  # 16, fpn_blocks.0
+
+  - [-1, 1, Conv, [256, 1, 1]]  # 17, Y4, lateral_convs.1
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
-  - [3, 1, Conv, [256, 1, 1, None, 1, 1, False]] # 19 input_proj.0
+  - [3, 1, Conv, [256, 1, 1, None, 1, 1, False]]  # 19 input_proj.0
   - [[-2, -1], 1, Concat, [1]]
-  - [-1, 3, RepC3, [256]] # X3 (21), fpn_blocks.1
-  - [-1, 1, Conv, [256, 3, 2]] # 22, downsample_convs.0
+  - [-1, 3, RepC3, [256]]  # 21, fpn_blocks.1
+
+  # === 新增：P2特征层（4-scale的关键） ===
+  - [-1, 1, Conv, [256, 1, 1]]  # 22, Y3, lateral_convs.2
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [1, 1, Conv, [256, 1, 1, None, 1, 1, False]]  # 24 input_proj.0
+  - [[-2, -1], 1, Concat, [1]]
+  - [-1, 3, RepC3, [256]]  # 26, fpn_blocks.2 (新增)
+
+  # === 下采样路径：从P2开始 ===
+  - [-1, 1, Conv, [256, 3, 2]]  # 27, downsample_convs.2
+  - [[-1, 22], 1, Concat, [1]]
+  - [-1, 3, RepC3, [256]]  # 29, pan_blocks.2 (新增)
+
+  - [-1, 1, Conv, [256, 3, 2]]  # 30, downsample_convs.1
+  - [[-1, 21], 1, Concat, [1]]
+  - [-1, 3, RepC3, [256]]  # 32, pan_blocks.1
+
+  - [-1, 1, Conv, [256, 3, 2]]  # 33, downsample_convs.0
   - [[-1, 17], 1, Concat, [1]]
-  - [-1, 3, RepC3, [256]] # F4 (24), pan_blocks.0
-  - [-1, 1, Conv, [256, 3, 2]] # 25, downsample_convs.1
+  - [-1, 3, RepC3, [256]]  # 35, pan_blocks.0
+
+  - [-1, 1, Conv, [256, 3, 2]]  # 36, downsample_convs.0 (P5)
   - [[-1, 12], 1, Concat, [1]]
-  - [-1, 3, RepC3, [256]] # F5 (27), pan_blocks.1
-  - [[21, 24, 27], 1, RTDETRDecoder, [nc]] # Detect(P3, P4, P5)
+  - [-1, 3, RepC3, [256]]  # 38, pan_blocks.0 (P5)
+
+  # Decoder：现在有4个尺度[26, 29, 32, 35]
+  - [[26, 29, 32, 38], 1, RTDETRDecoder, [nc]]  # Detect(P2, P3, P4, P5)
