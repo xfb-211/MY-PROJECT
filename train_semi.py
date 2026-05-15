@@ -601,8 +601,8 @@ def main():
     """
     阶段2：半监督训练学生模型
     """
-    # model_cfg = "rtdetr-l.pt"
-    model_cfg = "./ultralytics/cfg/models/rt-detr/rtdetr-l.yaml"
+    # ====== 关键：学生用预训练权重初始化 ======
+    model_cfg = "rtdetr-l.pt"  # ✅ 改为用预训练权重，不是yaml
     data_cfg = "./datasets/coco_semi.yaml"
     project = "runs/student_training"
     name = "RTDETR-Student-Semi"
@@ -612,12 +612,9 @@ def main():
     device = "0"
     workers = 0
 
-    # ====== 关键：使用阶段1训练的教师 ======
-    teacher_path = "runs/teacher_training/RTDETR-Teacher/weights/best.pt"
-
     LOGGER.info(colorstr("green", "=" * 60))
     LOGGER.info(colorstr("green", "PHASE 2: SEMI-SUPERVISED STUDENT TRAINING"))
-    LOGGER.info(colorstr("green", f"Teacher: {teacher_path}"))
+    LOGGER.info(colorstr("green", "Teacher: Cloned from student (rtdetr-l.pt)"))  # ✅ 更新日志
     LOGGER.info(colorstr("green", "=" * 60))
 
     overrides = {
@@ -651,3 +648,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
