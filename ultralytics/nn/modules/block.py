@@ -2286,8 +2286,9 @@ class SemiRTDETRLoss(nn.Module):
         except ImportError:
             row_inds, col_inds = np.arange(len(pred_boxes)), np.zeros(len(pred_boxes), dtype=int)
 
-        # 降低过滤阈值
-        valid_mask = alignment_cost[row_inds, col_inds] > 0.01
+        # 关键修复：所有操作在CPU/Numpy上完成
+        alignment_cost_np = alignment_cost.detach().cpu().numpy()
+        valid_mask = alignment_cost_np[row_inds, col_inds] > 0.01
         row_inds = row_inds[valid_mask]
         col_inds = col_inds[valid_mask]
 

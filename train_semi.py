@@ -30,7 +30,7 @@ class SemiRTDETRTrainer(RTDETRTrainer):
         self.semi_model = None
 
     def setup_model(self):
-        """初始化学生模型 + 单教师半监督模块"""
+        """初始化学生模型 + 教师克隆学生权重"""
         import copy
 
         if torch.cuda.is_available():
@@ -66,27 +66,12 @@ class SemiRTDETRTrainer(RTDETRTrainer):
         semi_cfg.setdefault("num_classes", self.data["nc"])
         semi_cfg.setdefault("device", "cuda" if device.type == "cuda" else "cpu")
 
-        teacher1_path = semi_cfg.get("teacher1_path", "rtdetr-l.pt")
-
-        try:
-            if not os.path.exists(teacher1_path):
-                LOGGER.warning(f"[SemiRTDETR] Teacher path {teacher1_path} not found, cloning student")
-                self.teacher1 = copy.deepcopy(self.model)
-            else:
-                LOGGER.info(f"[SemiRTDETR] Loading teacher from: {teacher1_path}")
-                ckpt1 = torch.load(teacher1_path, map_location=device, weights_only=False)
-                self.teacher1 = ckpt1['model'].float().eval() \
-                    if isinstance(ckpt1, dict) and 'model' in ckpt1 else ckpt1.float().eval()
-                self.teacher1 = self.teacher1.to(device)
-
-            for p in self.teacher1.parameters():
-                p.requires_grad_(False)
-
-        except Exception as e:
-            LOGGER.warning(f"[SemiRTDETR] Error loading teacher, cloning student: {e}")
-            self.teacher1 = copy.deepcopy(self.model)
-            for p in self.teacher1.parameters():
-                p.requires_grad_(False)
+        # 关键修改：Teacher直接克隆Student权重，不从文件加载
+        LOGGER.info("[SemiRTDETR] Cloning student weights as teacher initialization")
+        self.teacher1 = copy.deepcopy(self.model)
+        self.teacher1.eval()
+        for p in self.teacher1.parameters():
+            p.requires_grad_(False)
 
         self.pseudo_label_gen = SingleTeacherPseudoLabelGenerator(
             conf_thresh=semi_cfg.get("conf_thresh", 0.25),
@@ -115,13 +100,13 @@ class SemiRTDETRTrainer(RTDETRTrainer):
         ).to(device)
 
         self.burn_up_steps = semi_cfg.get("burn_up_steps", 20000)
-        self.initial_unsup_weight = semi_cfg.get("initial_unsup_weight", 0.5)
+        self.initial_unsup_weight = semi_cfg.get("initial_unsup_weight", 0.1)
         self.weight_increment = semi_cfg.get("weight_increment", 0.0)
-        self.max_unsup_weight = semi_cfg.get("max_unsup_weight", 2.0)
+        self.max_unsup_weight = semi_cfg.get("max_unsup_weight", 0.5)
         self.steps_per_epoch = semi_cfg.get("steps_per_epoch", 1479)
         self.global_step = 0
 
-        LOGGER.info("[SemiRTDETR] Semi-supervised modules initialized")
+        LOGGER.info(f"[SemiRTDETR] Semi-supervised modules initialized")
         LOGGER.info(f"[SemiRTDETR] Teacher params: {sum(p.numel() for p in self.teacher1.parameters())}")
 
     def _load_semi_cfg_from_yaml(self, yaml_path, semi_cfg):
